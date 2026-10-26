@@ -1,8 +1,8 @@
 import sys, os, json, socket, threading, time, uuid, struct, secrets, hashlib, hmac, logging
 from pathlib import Path
 from datetime import datetime
-from PySide6.QtCore import Qt, Signal, QObject, QTimer
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QUrl
+from PySide6.QtGui import QAction, QIcon, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QListWidget, QListWidgetItem, QTextEdit, QLineEdit, QPushButton, QFileDialog,
@@ -309,6 +309,29 @@ class SettingsDialog(QDialog):
             pair_btn = QPushButton("اتصال و جفت‌سازی با مدیر"); pair_btn.clicked.connect(self.pair); rl.addWidget(pair_btn)
             if self.w.profile.get("paired"):
                 rl.addWidget(QLabel("این دستگاه قبلاً جفت‌سازی شده است. نقش مدیر از این صفحه قابل فعال‌سازی نیست."))
+        tabs.addTab(role, "شبکه و نقش")
+
+        support = QWidget()
+        support_layout = QVBoxLayout(support)
+        support_layout.addWidget(QLabel("اگر LanChat برایتان مفید است، می‌توانید از توسعه‌دهنده حمایت کنید."))
+        coffee_btn = QPushButton("☕ یه قهوه مهمونم کن")
+        coffee_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://coffeebede.com/shahabsystem")))
+        support_layout.addWidget(coffee_btn)
+        reymit_btn = QPushButton("💙 نقدی خوشحالم کن")
+        reymit_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://reymit.ir/shahabsystem")))
+        support_layout.addWidget(reymit_btn)
+        support_layout.addStretch(1)
+        tabs.addTab(support, "حمایت از توسعه‌دهنده")
+
+        root.addWidget(tabs)
+        buttons = QHBoxLayout()
+        save_btn = QPushButton("ذخیره")
+        save_btn.clicked.connect(self.save)
+        buttons.addWidget(save_btn)
+        close_btn = QPushButton("بستن")
+        close_btn.clicked.connect(self.accept)
+        buttons.addWidget(close_btn)
+        root.addLayout(buttons)
 
     def make_manager(self):
         answer = QMessageBox.question(self, "راه‌اندازی مدیر", "این رایانه مدیر اصلی این شبکه شود؟ فقط یک رایانه را مدیر اصلی انتخاب کنید.")
@@ -317,12 +340,6 @@ class SettingsDialog(QDialog):
         save_profile(self.w.profile)
         QMessageBox.information(self, "مدیر شبکه", "نقش مدیر ذخیره شد. برای فعال‌شدن سرویس، LanChat را ببندید و دوباره اجرا کنید.")
         self.accept()
-        tabs.addTab(role, "شبکه و نقش")
-        root.addWidget(tabs)
-        buttons = QHBoxLayout()
-        save_btn = QPushButton("ذخیره"); save_btn.clicked.connect(self.save); buttons.addWidget(save_btn)
-        close_btn = QPushButton("بستن"); close_btn.clicked.connect(self.accept); buttons.addWidget(close_btn)
-        root.addLayout(buttons)
 
     def pick_avatar(self):
         p, _ = QFileDialog.getOpenFileName(self, "انتخاب تصویر", "", "Images (*.png *.jpg *.jpeg *.bmp)")
