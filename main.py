@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "LanChat"
+APP_VERSION = "1.0.1"
+DEVELOPER_NAME = "حامد محمدی"
 HOST = "0.0.0.0"
 PORT = 39872
 MAX_PACKET = 8 * 1024 * 1024
@@ -267,7 +269,20 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.w = parent
         self.setWindowTitle("تنظیمات LanChat")
-        self.resize(520, 420)
+        self.resize(560, 460)
+        self.setStyleSheet("""
+            QDialog, QWidget { background-color: #171a21; color: #e8eaf0; }
+            QTabWidget::pane { border: 1px solid #343b4a; background: #202530; top: -1px; }
+            QTabBar::tab { background: #252b38; color: #e8eaf0; border: 1px solid #343b4a;
+                padding: 9px 14px; margin-right: 3px; border-top-left-radius: 5px; border-top-right-radius: 5px; }
+            QTabBar::tab:selected { background: #087fe7; color: #ffffff; border-color: #1597ff; }
+            QTabBar::tab:hover:!selected { background: #343d4e; color: #ffffff; }
+            QLineEdit, QComboBox, QPlainTextEdit, QTextEdit { background: #202530; color: #f4f5f8;
+                border: 1px solid #465166; border-radius: 5px; padding: 6px; }
+            QCheckBox { color: #e8eaf0; spacing: 8px; }
+            QPushButton { background: #087fe7; color: #ffffff; border: 0; border-radius: 6px; padding: 8px 12px; }
+            QPushButton:hover { background: #1597ff; }
+        """)
         root = QVBoxLayout(self)
         tabs = QTabWidget()
         general = QWidget(); form = QFormLayout(general)
@@ -313,6 +328,8 @@ class SettingsDialog(QDialog):
 
         support = QWidget()
         support_layout = QVBoxLayout(support)
+        support_layout.addWidget(QLabel("توسعه‌دهنده: حامد محمدی"))
+        support_layout.addWidget(QLabel(f"نسخه برنامه: {APP_VERSION}"))
         support_layout.addWidget(QLabel("اگر LanChat برایتان مفید است، می‌توانید از توسعه‌دهنده حمایت کنید."))
         coffee_btn = QPushButton("☕ یه قهوه مهمونم کن")
         coffee_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://coffeebede.com/shahabsystem")))
@@ -391,7 +408,7 @@ class LanChat(QMainWindow):
         self.admin_token = None
         self.profile["admin_token"] = ""
         self.running = True
-        self.setWindowTitle("LanChat — پیام‌رسان شبکه محلی")
+        self.setWindowTitle(f"LanChat {APP_VERSION} — پیام‌رسان شبکه محلی")
         self.setWindowIcon(QIcon(resource_path("lanchat.ico")))
         self.resize(1050, 680)
         self._build_ui()
@@ -411,7 +428,11 @@ class LanChat(QMainWindow):
         QListWidget,QTextEdit,QLineEdit,QPlainTextEdit,QComboBox,QTableWidget {background:#202530;border:1px solid #343b4a;border-radius:6px;padding:6px;color:#f4f5f8}
         QPushButton {background:#087fe7;color:white;border:0;border-radius:6px;padding:8px 12px}
         QPushButton:hover {background:#1597ff}
-        QTabWidget::pane {border:1px solid #343b4a}
+        QTabWidget::pane {border:1px solid #343b4a; background:#202530; top:-1px}
+        QTabBar::tab {background:#252b38; color:#e8eaf0; border:1px solid #343b4a; padding:8px 12px; margin-right:3px; border-top-left-radius:5px; border-top-right-radius:5px}
+        QTabBar::tab:selected {background:#087fe7; color:#ffffff; border-color:#1597ff}
+        QTabBar::tab:hover:!selected {background:#343d4e; color:#ffffff}
+        QHeaderView::section {background:#252b38; color:#ffffff; padding:6px; border:1px solid #343b4a}
         """)
         root = QWidget(); self.setCentralWidget(root); layout = QHBoxLayout(root)
         side = QVBoxLayout()
