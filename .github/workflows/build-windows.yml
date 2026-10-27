@@ -24,9 +24,16 @@ jobs:
       - name: Syntax check
         run: python -m py_compile main.py
       - name: Build portable EXE
-        run: pyinstaller --noconfirm --clean --windowed --onefile --name LanChat --icon lanchat.ico --add-data "lanchat.ico;." main.py
+        run: >-
+          pyinstaller --noconfirm --clean --windowed --onefile --name LanChat
+          --icon lanchat.ico --add-data "lanchat.ico;."
+          --exclude-module tkinter --exclude-module unittest
+          --exclude-module test --exclude-module pydoc
+          --exclude-module doctest --exclude-module distutils
+          --exclude-module ensurepip --exclude-module lib2to3
+          main.py
       - uses: actions/upload-artifact@v4
         with:
-          name: LanChat-Windows
+          name: LanChat-Windows-1.1.0
           path: dist/LanChat.exe
           if-no-files-found: error
