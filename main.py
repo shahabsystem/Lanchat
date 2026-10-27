@@ -2,7 +2,7 @@ import sys, os, json, socket, threading, time, uuid, struct, secrets, hashlib, h
 from pathlib import Path
 from datetime import datetime
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QUrl
-from PySide6.QtGui import QAction, QIcon, QDesktopServices
+from PySide6.QtGui import QAction, QIcon, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QListWidget, QListWidgetItem, QTextEdit, QLineEdit, QPushButton, QFileDialog,
@@ -12,14 +12,21 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "LanChat"
+APP_VERSION = "1.1.0"
+DEVELOPER_NAME = "حامد محمدی"
 HOST = "0.0.0.0"
 PORT = 39872
+DISCOVERY_PORT = 39873
+DISCOVERY_REQUEST = b"LANCHAT_DISCOVER_V2"
+ONLINE_TIMEOUT = 12.0
+DISCOVERY_WINDOW = 1.2
 MAX_PACKET = 8 * 1024 * 1024
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = DATA_DIR / "profile.json"
 STATE_PATH = DATA_DIR / "manager_state.json"
 LOG_PATH = DATA_DIR / "messages.txt"
+MANAGER_LOG_PATH = DATA_DIR / "manager_messages.txt"
 
 DEFAULTS = {
     "name": socket.gethostname(), "id": str(uuid.uuid4()), "avatar": "",
@@ -53,6 +60,14 @@ def log_message(profile, text):
     except OSError:
         pass
 
+def log_manager_message(message):
+    """Append a message record to the manager computer's local archive (JSON Lines)."""
+    try:
+        with MANAGER_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(message, ensure_ascii=False) + "\n")
+    except OSError:
+        logging.exception("manager message archive")
+
 def resource_path(name):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
@@ -84,6 +99,50 @@ def rpc(host, request, timeout=4):
         s.sendall(pack(request))
         return recv_obj(s)
 
+def _lan_broadcast_targets():
+    """Return limited-broadcast plus per-interface subnet broadcasts when available."""
+    targets = {"255.255.255.255"}
+    try:
+        import psutil
+        for addresses in psutil.net_if_addrs().values():
+            for addr in addresses:
+                if addr.family == socket.AF_INET and addr.address and addr.broadcast:
+                    if not addr.address.startswith(("127.", "169.254.")):
+                        targets.add(addr.broadcast)
+    except Exception:
+        # Global broadcast remains as a portable fallback if interface enumeration is unavailable.
+        pass
+    return sorted(targets)
+
+def discover_manager(timeout=DISCOVERY_WINDOW):
+    """Find a LanChat manager across active IPv4 LAN interfaces, not just global broadcast."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(0.15)
+        sock.bind(("", 0))
+        for target in _lan_broadcast_targets():
+            try:
+                sock.sendto(DISCOVERY_REQUEST, (target, DISCOVERY_PORT))
+            except OSError:
+                continue
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data, addr = sock.recvfrom(512)
+            except socket.timeout:
+                continue
+            if data.startswith(b"LANCHAT_MANAGER_V2|"):
+                fields = data.decode("utf-8", "ignore").split("|")
+                if len(fields) >= 3 and fields[2].isdigit():
+                    return addr[0]
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+    return ""
+
 class Bus(QObject):
     event = Signal(dict)
     status = Signal(str)
@@ -103,6 +162,7 @@ class ManagerServer:
         self.online = {}
         self.running = False
         self.server_socket = None
+        self.discovery_socket = None
         if not self.state.get("pair_code_hash"):
             self.new_pair_code()
         self.save()
@@ -122,12 +182,35 @@ class ManagerServer:
         if self.running: return
         self.running = True
         threading.Thread(target=self._listen, daemon=True).start()
+        threading.Thread(target=self._discovery_listen, daemon=True).start()
+
+    def _discovery_listen(self):
+        """Answer LAN broadcast discovery requests so clients can find this manager automatically."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", DISCOVERY_PORT))
+            sock.settimeout(1)
+            self.discovery_socket = sock
+            while self.running:
+                try:
+                    data, addr = sock.recvfrom(512)
+                    if data == DISCOVERY_REQUEST:
+                        response = f"LANCHAT_MANAGER_V2|{socket.gethostname()}|{PORT}".encode("utf-8")
+                        sock.sendto(response, addr)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+        except OSError:
+            logging.exception("LAN discovery listener")
 
     def stop(self):
         self.running = False
-        try:
-            if self.server_socket: self.server_socket.close()
-        except OSError: pass
+        for sock in (self.server_socket, self.discovery_socket):
+            try:
+                if sock: sock.close()
+            except OSError: pass
 
     def _listen(self):
         try:
@@ -164,6 +247,22 @@ class ManagerServer:
         action = req.get("action")
         uid = str(req.get("user_id", ""))
         with self.lock:
+            if action == "join_auto":
+                # LAN discovery is intended for a trusted local network; no manual pairing code is needed.
+                if not uid:
+                    return {"ok": False, "error": "شناسه دستگاه نامعتبر است."}
+                user = self.state["users"].get(uid)
+                if not user:
+                    user = {"id": uid, "name": str(req.get("name", "کاربر"))[:80], "ip": addr[0],
+                            "blocked": False, "muted": False, "groups": [], "joined": time.time()}
+                    self.state["users"][uid] = user
+                if user.get("blocked"):
+                    return {"ok": False, "blocked": True, "error": "دسترسی این کاربر توسط مدیر مسدود شده است."}
+                user["name"] = str(req.get("name", user.get("name", "کاربر")))[:80]
+                user["ip"] = addr[0]
+                self.online[uid] = time.time()
+                self.save()
+                return {"ok": True, "role": "client", "settings": self.public_settings(), "user": user}
             if action == "pair":
                 code = str(req.get("code", "")).strip().upper()
                 expected = self.state.get("pair_code_hash", "")
@@ -189,8 +288,11 @@ class ManagerServer:
                            (m.get("to", "").startswith("group:") and m["to"][6:] in user.get("groups", []))]
                 self.state["messages"] = [m for m in self.state["messages"] if m not in pending]
                 self.save()
+                online_ids = [peer_id for peer_id, seen in self.online.items()
+                              if time.time() - seen <= ONLINE_TIMEOUT and
+                              peer_id in self.state["users"] and not self.state["users"][peer_id].get("blocked")]
                 return {"ok": True, "settings": self.public_settings(), "users": self.public_users(),
-                        "groups": self.state["groups"], "messages": pending, "user": user}
+                        "online": online_ids, "groups": self.state["groups"], "messages": pending, "user": user}
             if action == "send":
                 user = self.state["users"].get(uid)
                 if not user: return {"ok": False, "error": "ابتدا باید جفت‌سازی شوید."}
@@ -210,6 +312,7 @@ class ManagerServer:
                 if not recipients: return {"ok": False, "error": "گیرنده‌ای برای این پیام پیدا نشد."}
                 msg = {"id": str(uuid.uuid4()), "from": uid, "sender": user.get("name", "کاربر"),
                        "to": target, "text": text, "time": time.time()}
+                log_manager_message(msg)
                 for recipient in recipients:
                     item = msg.copy(); item["to"] = recipient
                     self.state["messages"].append(item)
@@ -220,8 +323,12 @@ class ManagerServer:
                 if not self._is_admin(req): return {"ok": False, "error": "احراز هویت مدیر ناموفق بود."}
                 op = req.get("op")
                 if op == "snapshot":
+                    now = time.time()
+                    online_ids = [peer_id for peer_id, seen in self.online.items()
+                                  if now - seen <= ONLINE_TIMEOUT and
+                                  peer_id in self.state["users"] and not self.state["users"][peer_id].get("blocked")]
                     return {"ok": True, "users": self.public_users(), "groups": self.state["groups"],
-                            "settings": self.state["settings"], "online": list(self.online.keys())}
+                            "settings": self.state["settings"], "online": online_ids}
                 if op == "user":
                     target = self.state["users"].get(str(req.get("target", "")))
                     if not target: return {"ok": False, "error": "کاربر پیدا نشد."}
@@ -244,11 +351,20 @@ class ManagerServer:
                 if op == "broadcast":
                     text = str(req.get("text", ""))[:12000]
                     if not text.strip(): return {"ok": False, "error": "متن پیام خالی است."}
+                    archive_item = {"id":str(uuid.uuid4()),"from":"ADMIN","sender":"مدیر",
+                                    "to":"*","text":text,"time":time.time()}
+                    log_manager_message(archive_item)
                     for uid2, user2 in self.state["users"].items():
                         if not user2.get("blocked"):
-                            self.state["messages"].append({"id":str(uuid.uuid4()),"from":"ADMIN","sender":"مدیر",
-                                "to":uid2,"text":text,"time":time.time()})
+                            item = archive_item.copy(); item["to"] = uid2
+                            self.state["messages"].append(item)
                     self.save(); return {"ok": True}
+                if op == "message_log":
+                    try:
+                        lines = MANAGER_LOG_PATH.read_text(encoding="utf-8").splitlines()[-1000:]
+                    except FileNotFoundError:
+                        lines = []
+                    return {"ok": True, "lines": lines, "path": str(MANAGER_LOG_PATH)}
                 if op == "paircode":
                     code = self.new_pair_code()
                     return {"ok": True, "code": code}
@@ -267,7 +383,21 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.w = parent
         self.setWindowTitle("تنظیمات LanChat")
-        self.resize(520, 420)
+        self.resize(560, 460)
+        self.setStyleSheet("""
+            QDialog, QWidget { background-color: #171a21; color: #e8eaf0; }
+            QTabWidget { background-color: #171a21; color: #e8eaf0; }
+            QTabWidget::pane { border: 1px solid #343b4a; background: #202530; top: -1px; }
+            QTabWidget QTabBar::tab { background: #252b38; color: #f4f5f8; border: 1px solid #465166;
+                padding: 9px 14px; margin-right: 3px; min-height: 22px; border-top-left-radius: 5px; border-top-right-radius: 5px; }
+            QTabWidget QTabBar::tab:selected { background: #087fe7; color: #ffffff; border-color: #1597ff; }
+            QTabWidget QTabBar::tab:hover:!selected { background: #343d4e; color: #ffffff; }
+            QLineEdit, QComboBox, QPlainTextEdit, QTextEdit { background: #202530; color: #f4f5f8;
+                border: 1px solid #465166; border-radius: 5px; padding: 6px; }
+            QCheckBox { color: #e8eaf0; spacing: 8px; }
+            QPushButton { background: #087fe7; color: #ffffff; border: 0; border-radius: 6px; padding: 8px 12px; }
+            QPushButton:hover { background: #1597ff; }
+        """)
         root = QVBoxLayout(self)
         tabs = QTabWidget()
         general = QWidget(); form = QFormLayout(general)
@@ -297,6 +427,11 @@ class SettingsDialog(QDialog):
             code_btn = QPushButton("تولید کد جفت‌سازی جدید")
             code_btn.clicked.connect(self.new_code); rl.addWidget(code_btn)
             self.code_label = QLabel("کد فعلی فقط هنگام تولید نمایش داده می‌شود."); rl.addWidget(self.code_label)
+            password_btn = QPushButton("تعیین / تغییر رمز مدیر")
+            password_btn.clicked.connect(self.set_manager_password); rl.addWidget(password_btn)
+            downgrade_btn = QPushButton("تغییر نقش به کاربر عادی…")
+            downgrade_btn.clicked.connect(self.downgrade_manager); rl.addWidget(downgrade_btn)
+            rl.addWidget(QLabel("پیام‌های عبوری از این رایانه در گزارش محلی مدیر ذخیره می‌شوند؛ این موضوع را به کاربران اطلاع دهید."))
         else:
             if not self.w.profile.get("paired") and self.w.profile.get("role") != "client":
                 rl.addWidget(QLabel("این رایانه را برای اولین بار به‌عنوان مدیر شبکه راه‌اندازی کنید، یا به مدیر موجود متصل شوید."))
@@ -313,6 +448,8 @@ class SettingsDialog(QDialog):
 
         support = QWidget()
         support_layout = QVBoxLayout(support)
+        support_layout.addWidget(QLabel("توسعه‌دهنده: حامد محمدی"))
+        support_layout.addWidget(QLabel(f"نسخه برنامه: {APP_VERSION}"))
         support_layout.addWidget(QLabel("اگر LanChat برایتان مفید است، می‌توانید از توسعه‌دهنده حمایت کنید."))
         coffee_btn = QPushButton("☕ یه قهوه مهمونم کن")
         coffee_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://coffeebede.com/shahabsystem")))
@@ -336,10 +473,55 @@ class SettingsDialog(QDialog):
     def make_manager(self):
         answer = QMessageBox.question(self, "راه‌اندازی مدیر", "این رایانه مدیر اصلی این شبکه شود؟ فقط یک رایانه را مدیر اصلی انتخاب کنید.")
         if answer != QMessageBox.StandardButton.Yes: return
-        self.w.profile.update({"role":"manager", "paired":False, "manager_host":""})
+        password, ok = QInputDialog.getText(self, "رمز مدیر", "یک رمز مدیریتی تعیین کنید (حداقل ۶ نویسه):", QLineEdit.EchoMode.Password)
+        if not ok: return
+        if len(password) < 6:
+            QMessageBox.warning(self, "رمز نامعتبر", "رمز باید حداقل ۶ نویسه داشته باشد."); return
+        salt = secrets.token_hex(16)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("ascii"), 200000).hex()
+        self.w.profile.update({"role":"manager", "paired":False, "manager_host":"",
+                               "manager_password_salt":salt, "manager_password_hash":digest})
         save_profile(self.w.profile)
-        QMessageBox.information(self, "مدیر شبکه", "نقش مدیر ذخیره شد. برای فعال‌شدن سرویس، LanChat را ببندید و دوباره اجرا کنید.")
+        QMessageBox.information(self, "مدیر شبکه", "نقش مدیر ذخیره شد. برای فعال‌شدن سرویس، LanChat را ببندید و دوباره اجرا کنید. این رمز برای بازگشت به نقش کاربر لازم است.")
         self.accept()
+
+    def set_manager_password(self):
+        old_hash = self.w.profile.get("manager_password_hash", "")
+        if old_hash:
+            old_password, ok = QInputDialog.getText(self, "تأیید مدیر", "رمز فعلی مدیر:", QLineEdit.EchoMode.Password)
+            if not ok: return
+            salt0 = self.w.profile.get("manager_password_salt", "")
+            digest0 = hashlib.pbkdf2_hmac("sha256", old_password.encode("utf-8"), salt0.encode("ascii"), 200000).hex() if salt0 else ""
+            if not hmac.compare_digest(digest0, old_hash):
+                QMessageBox.warning(self, "رمز نادرست", "رمز فعلی صحیح نیست."); return
+        new_password, ok = QInputDialog.getText(self, "رمز مدیر", "رمز جدید (حداقل ۶ نویسه):", QLineEdit.EchoMode.Password)
+        if not ok: return
+        if len(new_password) < 6:
+            QMessageBox.warning(self, "رمز نامعتبر", "رمز باید حداقل ۶ نویسه باشد."); return
+        salt = secrets.token_hex(16)
+        digest = hashlib.pbkdf2_hmac("sha256", new_password.encode("utf-8"), salt.encode("ascii"), 200000).hex()
+        self.w.profile["manager_password_salt"] = salt
+        self.w.profile["manager_password_hash"] = digest
+        save_profile(self.w.profile)
+        QMessageBox.information(self, "رمز مدیر", "رمز مدیر ذخیره شد.")
+
+    def downgrade_manager(self):
+        if not self.w.profile.get("manager_password_hash"):
+            QMessageBox.warning(self, "رمز مدیر تنظیم نشده", "ابتدا گزینه «تعیین / تغییر رمز مدیر» را انتخاب و یک رمز تعیین کنید."); return
+        password, ok = QInputDialog.getText(self, "تأیید رمز مدیر", "برای تغییر نقش به کاربر عادی، رمز مدیر را وارد کنید:", QLineEdit.EchoMode.Password)
+        if not ok: return
+        salt = self.w.profile.get("manager_password_salt", "")
+        expected = self.w.profile.get("manager_password_hash", "")
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("ascii"), 200000).hex() if salt and expected else ""
+        if not expected or not hmac.compare_digest(actual, expected):
+            QMessageBox.warning(self, "رمز نادرست", "رمز مدیر نادرست است یا برای این نسخه تنظیم نشده است."); return
+        answer = QMessageBox.warning(self, "تغییر نقش مدیر", "سرویس مدیر متوقف می‌شود و این رایانه به نقش کاربر عادی برمی‌گردد. برای اتصال به یک مدیر باید دوباره جفت‌سازی شود. ادامه می‌دهید?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes: return
+        self.w.profile.update({"role":"unpaired", "paired":False, "manager_host":""})
+        save_profile(self.w.profile)
+        QMessageBox.information(self, "تغییر نقش", "نقش تغییر کرد. برنامه برای اعمال کامل تغییرات بسته و دوباره اجرا می‌شود.")
+        self.accept()
+        self.w.quit_app()
 
     def pick_avatar(self):
         p, _ = QFileDialog.getOpenFileName(self, "انتخاب تصویر", "", "Images (*.png *.jpg *.jpeg *.bmp)")
@@ -391,7 +573,8 @@ class LanChat(QMainWindow):
         self.admin_token = None
         self.profile["admin_token"] = ""
         self.running = True
-        self.setWindowTitle("LanChat — پیام‌رسان شبکه محلی")
+        self.reconnect_discovery = False
+        self.setWindowTitle(f"LanChat {APP_VERSION} — پیام‌رسان شبکه محلی")
         self.setWindowIcon(QIcon(resource_path("lanchat.ico")))
         self.resize(1050, 680)
         self._build_ui()
@@ -403,7 +586,39 @@ class LanChat(QMainWindow):
         elif self.profile.get("paired"):
             self._start_client_poll()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_online); self.timer.start(5000)
-        self.statusBar().showMessage("برای شروع، از تنظیمات نقش مدیر یا اتصال به مدیر را انتخاب کنید.")
+        self.discovery_timer = QTimer(self); self.discovery_timer.timeout.connect(self.auto_discover_manager)
+        if self.profile.get("role") != "manager" and not self.profile.get("paired"):
+            self.discovery_timer.start(4000)
+            QTimer.singleShot(700, self.auto_discover_manager)
+        self.statusBar().showMessage("LanChat به‌صورت خودکار در حال جست‌وجوی مدیر شبکه است؛ برای شبکه محلی مورداعتماد.")
+
+    def auto_discover_manager(self):
+        if self.profile.get("role") == "manager":
+            if hasattr(self, "discovery_timer"): self.discovery_timer.stop()
+            return
+        if self.profile.get("paired") and not self.reconnect_discovery:
+            if hasattr(self, "discovery_timer"): self.discovery_timer.stop()
+            return
+        host = discover_manager()
+        if not host: return
+        try:
+            result = rpc(host, {"action":"join_auto", "user_id":self.profile["id"], "name":self.profile.get("name", socket.gethostname())})
+        except Exception:
+            return
+        if result.get("ok"):
+            was_paired = bool(self.profile.get("paired"))
+            self.profile.update({"role":"client", "paired":True, "manager_host":host})
+            save_profile(self.profile)
+            self.reconnect_discovery = False
+            if hasattr(self, "discovery_timer"): self.discovery_timer.stop()
+            if not was_paired:
+                self._start_client_poll()
+            self.statusBar().showMessage(f"مدیر شبکه به‌طور خودکار شناسایی شد: {host}")
+            self.refresh_profile()
+        elif result.get("blocked"):
+            self.reconnect_discovery = False
+            if hasattr(self, "discovery_timer"): self.discovery_timer.stop()
+            self.statusBar().showMessage("این دستگاه توسط مدیر شبکه مسدود شده است.")
 
     def _build_ui(self):
         self.setStyleSheet("""
@@ -411,7 +626,12 @@ class LanChat(QMainWindow):
         QListWidget,QTextEdit,QLineEdit,QPlainTextEdit,QComboBox,QTableWidget {background:#202530;border:1px solid #343b4a;border-radius:6px;padding:6px;color:#f4f5f8}
         QPushButton {background:#087fe7;color:white;border:0;border-radius:6px;padding:8px 12px}
         QPushButton:hover {background:#1597ff}
-        QTabWidget::pane {border:1px solid #343b4a}
+        QTabWidget {background:#171a21;color:#e8eaf0}
+        QTabWidget::pane {border:1px solid #343b4a;background:#202530;top:-1px}
+        QTabWidget QTabBar::tab {background:#252b38;color:#f4f5f8;border:1px solid #465166;padding:8px 12px;margin-right:3px;min-height:22px;border-top-left-radius:5px;border-top-right-radius:5px}
+        QTabWidget QTabBar::tab:selected {background:#087fe7;color:#ffffff;border-color:#1597ff}
+        QTabWidget QTabBar::tab:hover:!selected {background:#343d4e;color:#ffffff}
+        QHeaderView::section {background:#252b38; color:#ffffff; padding:6px; border:1px solid #343b4a}
         """)
         root = QWidget(); self.setCentralWidget(root); layout = QHBoxLayout(root)
         side = QVBoxLayout()
@@ -444,6 +664,13 @@ class LanChat(QMainWindow):
         self.admin_broadcast = QPlainTextEdit(); self.admin_broadcast.setPlaceholderText("پیام اطلاع‌رسانی مدیر به همه کاربران")
         bpage = QWidget(); bl = QVBoxLayout(bpage); bl.addWidget(self.admin_broadcast); bb = QPushButton("ارسال اطلاعیه مدیر"); bb.clicked.connect(self.admin_broadcast_send); bl.addWidget(bb)
         self.admin_tabs.addTab(bpage,"اطلاعیه")
+        log_page = QWidget(); log_layout = QVBoxLayout(log_page)
+        log_layout.addWidget(QLabel("گزارش پیام‌های عبوری از سرور این رایانه؛ فایل محلی manager_messages.txt در پوشه AppData/LanChat نگهداری می‌شود. به کاربران اطلاع دهید که پیام‌ها در این رایانه بایگانی می‌شوند."))
+        self.admin_message_log = QPlainTextEdit(); self.admin_message_log.setReadOnly(True); log_layout.addWidget(self.admin_message_log, 1)
+        log_buttons = QHBoxLayout(); refresh_log = QPushButton("بارگذاری گزارش"); refresh_log.clicked.connect(self.refresh_message_log); log_buttons.addWidget(refresh_log)
+        open_log = QPushButton("باز کردن فایل گزارش"); open_log.clicked.connect(self.open_manager_log); log_buttons.addWidget(open_log)
+        log_layout.addLayout(log_buttons)
+        self.admin_tabs.addTab(log_page, "گزارش پیام‌ها")
         self.admin_tabs.hide()
         layout.addWidget(self.admin_tabs,2)
         self.refresh_profile()
@@ -482,16 +709,22 @@ class LanChat(QMainWindow):
         try:
             result = rpc(host, {"action":"ping", "user_id":self.profile["id"], "name":self.profile.get("name","کاربر")})
             if not result.get("ok"):
-                self.bus.status.emit(result.get("error","اتصال مدیر برقرار نیست")); return
+                self.bus.status.emit(result.get("error","اتصال مدیر برقرار نیست"))
+                self.reconnect_discovery = True
+                if hasattr(self, "discovery_timer"): self.discovery_timer.start(4000)
+                return
             self.profile["_manager_settings"] = result.get("settings", {})
             save_profile(self.profile)
             for msg in result.get("messages", []):
                 self.bus.event.emit({"kind":"message", **msg})
             users = result.get("users", [])
-            self.peers = {u["id"]:u for u in users if u.get("id") != self.profile["id"]}
-            self.bus.event.emit({"kind":"users", "users":users, "groups":result.get("groups",{})})
+            online_ids = set(result.get("online", []))
+            self.peers = {u["id"]:u for u in users if u.get("id") != self.profile["id"] and u.get("id") in online_ids}
+            self.bus.event.emit({"kind":"users", "users":users, "online":list(online_ids), "groups":result.get("groups",{})})
         except Exception as e:
             self.bus.status.emit(f"اتصال به مدیر برقرار نیست: {e}")
+            self.reconnect_discovery = True
+            if hasattr(self, "discovery_timer"): self.discovery_timer.start(4000)
 
     def refresh_online(self):
         if self.profile.get("role") == "manager" and self.manager_state:
@@ -507,11 +740,16 @@ class LanChat(QMainWindow):
                 self.tray.showMessage(f"LanChat — {sender}", body[:200], QSystemTrayIcon.MessageIcon, 5000)
         elif event.get("kind") == "users":
             self.user_list.clear()
-            for u in event.get("users", []):
-                if u.get("id") == self.profile["id"]: continue
-                if u.get("blocked"): continue
-                item = QListWidgetItem(f"👤 {u.get('name','کاربر')} · {u.get('ip','')}")
+            online_ids = set(event.get("online", []))
+            visible = [u for u in event.get("users", [])
+                       if u.get("id") != self.profile["id"] and not u.get("blocked") and u.get("id") in online_ids]
+            visible.sort(key=lambda u: str(u.get("name", "")).casefold())
+            for u in visible:
+                item = QListWidgetItem(f"🟢 {u.get('name','کاربر')} · {u.get('ip','')}")
                 item.setData(Qt.ItemDataRole.UserRole, u["id"]); self.user_list.addItem(item)
+            if not visible:
+                self.user_list.addItem(QListWidgetItem("در حال حاضر کاربر دیگری آنلاین نیست"))
+            self.chat_title.setText(f"کاربران آنلاین: {len(visible)}")
             self.group_target.clear(); self.group_target.addItem("ارسال به گروه…","")
             for gid, g in event.get("groups", {}).items(): self.group_target.addItem(g.get("name",gid), gid)
 
@@ -546,8 +784,11 @@ class LanChat(QMainWindow):
                 gid = target[6:]; group = self.manager_state.state["groups"].get(gid, {})
                 recipients = group.get("members", [])
             else: recipients = [target] if target in self.manager_state.state["users"] else []
+            archive_item = {"id":str(uuid.uuid4()),"from":"MANAGER","sender":self.profile["name"],"to":target,"text":text,"time":time.time()}
+            log_manager_message(archive_item)
             for uid in recipients:
-                self.manager_state.state["messages"].append({"id":str(uuid.uuid4()),"from":"MANAGER","sender":self.profile["name"],"to":uid,"text":text,"time":time.time()})
+                item = archive_item.copy(); item["to"] = uid
+                self.manager_state.state["messages"].append(item)
             self.manager_state.save()
         return {"ok": bool(recipients), "error":"گیرنده‌ای پیدا نشد."}
 
@@ -565,7 +806,7 @@ class LanChat(QMainWindow):
         users = snap.get("users", []); online = set(snap.get("online", []))
         self.admin_users.setRowCount(len(users))
         for r,u in enumerate(users):
-            vals = [u.get("name",""),u.get("ip",""),"آنلاین" if u["id"] in online and time.time()-self.manager_state.online.get(u["id"],0)<12 else "آفلاین",
+            vals = [u.get("name",""),u.get("ip",""),"آنلاین" if u["id"] in online and time.time()-self.manager_state.online.get(u["id"],0)<=ONLINE_TIMEOUT else "آفلاین",
                     "محدود" if u.get("muted") else "مجاز",u.get("id","")]
             for c,v in enumerate(vals): self.admin_users.setItem(r,c,QTableWidgetItem(str(v)))
         self.admin_users.resizeColumnsToContents()
@@ -607,6 +848,28 @@ class LanChat(QMainWindow):
             self.admin_broadcast.clear(); QMessageBox.information(self,"اطلاعیه","پیام در صف ارسال قرار گرفت.")
         else: QMessageBox.warning(self,"خطا",result.get("error","خطا"))
 
+    def refresh_message_log(self):
+        result = self.admin_call("message_log")
+        if not result.get("ok"):
+            QMessageBox.warning(self, "گزارش پیام‌ها", result.get("error", "گزارش قابل خواندن نیست.")); return
+        rendered = []
+        for line in result.get("lines", []):
+            try:
+                m = json.loads(line)
+                stamp = datetime.fromtimestamp(float(m.get("time", 0))).strftime("%Y-%m-%d %H:%M:%S")
+                rendered.append(f"[{stamp}] {m.get('sender','کاربر')} → {m.get('to','')}: {m.get('text','')}")
+            except Exception:
+                rendered.append(line)
+        self.admin_message_log.setPlainText("\n".join(rendered) or "هنوز پیامی در گزارش ثبت نشده است.")
+        self.admin_message_log.moveCursor(QTextCursor.MoveOperation.End)
+
+    def open_manager_log(self):
+        try:
+            if not MANAGER_LOG_PATH.exists(): MANAGER_LOG_PATH.touch()
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(MANAGER_LOG_PATH)))
+        except OSError as e:
+            QMessageBox.warning(self, "گزارش پیام‌ها", str(e))
+
     def open_settings(self):
         dlg = SettingsDialog(self); dlg.exec()
 
@@ -642,7 +905,7 @@ class LanChat(QMainWindow):
         self.tray.hide(); QApplication.quit()
 
 def main():
-    app = QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setQuitOnLastWindowClosed(False)
+    app = QApplication(sys.argv); app.setStyle("Fusion"); app.setApplicationName(APP_NAME); app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(QIcon(resource_path("lanchat.ico")))
     window = LanChat()
     if "--minimized" in sys.argv or window.profile.get("start_minimized", False): window.hide()
