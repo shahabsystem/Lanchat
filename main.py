@@ -1,15 +1,16 @@
-import sys, os, json, socket, threading, time, uuid, struct, logging
+import sys, os, json, socket, threading, time, uuid, struct, logging, platform
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from PySide6.QtCore import Qt, Signal, QObject, QTimer
-from PySide6.QtGui import QIcon, QDesktopServices
+from PySide6.QtGui import QIcon, QDesktopServices, QFont
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QTextEdit, QLineEdit, QPushButton, QMessageBox,
-    QSystemTrayIcon, QMenu, QStyle, QDialog, QFormLayout, QCheckBox, QComboBox)
+    QSystemTrayIcon, QMenu, QStyle, QDialog, QFormLayout, QCheckBox, QComboBox, QFontComboBox, QSpinBox, QInputDialog)
 
 APP_NAME = 'LanChat'
-APP_VERSION = '1.2.0'
+APP_VERSION = '1.3.0'
 DEVELOPER_EMAIL = 'hamedmohammadinikche@gmail.com'
 TCP_PORT = 39872
 UDP_PORT = 39873
@@ -30,6 +31,12 @@ def load_profile():
     p.setdefault('theme', 'dark')
     p.setdefault('save_messages', True)
     p.setdefault('notifications', True)
+    p.setdefault('notification_sound', True)
+    p.setdefault('always_on_top', False)
+    p.setdefault('font_family', 'Segoe UI')
+    p.setdefault('font_size', 10)
+    p.setdefault('peer_groups', {})
+    p.setdefault('groups', ['عمومی'])
     p.setdefault('close_to_tray', False)
     return p
 
@@ -227,15 +234,20 @@ class SettingsDialog(QDialog):
         self.save_logs = QCheckBox('ذخیره پیام‌های ارسالی و دریافتی در این رایانه')
         self.save_logs.setChecked(parent.profile.get('save_messages', True))
         self.notifications = QCheckBox('نمایش اعلان پیام جدید'); self.notifications.setChecked(parent.profile.get('notifications', True))
-        form.addRow('نام نمایشی:', self.name); form.addRow('پوسته:', self.theme)
-        layout.addLayout(form); layout.addWidget(self.save_logs); layout.addWidget(self.notifications)
+        self.sound = QCheckBox('پخش صدای اعلان'); self.sound.setChecked(parent.profile.get('notification_sound', True))
+        self.topmost = QCheckBox('قرار گرفتن پنجره روی همه برنامه‌ها'); self.topmost.setChecked(parent.profile.get('always_on_top', False))
+        self.font = QFontComboBox(); self.font.setCurrentFont(QFont(parent.profile.get('font_family', 'Segoe UI')))
+        self.font_size = QSpinBox(); self.font_size.setRange(8, 28); self.font_size.setValue(int(parent.profile.get('font_size', 10)))
+        form.addRow('نام نمایشی:', self.name); form.addRow('پوسته:', self.theme); form.addRow('فونت:', self.font); form.addRow('اندازه فونت:', self.font_size)
+        layout.addLayout(form); layout.addWidget(self.save_logs); layout.addWidget(self.notifications); layout.addWidget(self.sound); layout.addWidget(self.topmost)
         buttons = QHBoxLayout(); save = QPushButton('ذخیره'); cancel = QPushButton('انصراف')
         save.clicked.connect(self.accept); cancel.clicked.connect(self.reject); buttons.addWidget(save); buttons.addWidget(cancel)
         layout.addLayout(buttons)
 
     def values(self):
         return {'name': self.name.text().strip() or socket.gethostname(), 'theme':self.theme.currentData(),
-                'save_messages':self.save_logs.isChecked(), 'notifications':self.notifications.isChecked()}
+                'save_messages':self.save_logs.isChecked(), 'notifications':self.notifications.isChecked(), 'notification_sound':self.sound.isChecked(),
+                'always_on_top':self.topmost.isChecked(), 'font_family':self.font.currentFont().family(), 'font_size':self.font_size.value()}
 
 
 class LanChat(QMainWindow):
@@ -246,7 +258,7 @@ class LanChat(QMainWindow):
         self.events.message_received.connect(self.receive_message); self.events.status.connect(self.set_status)
         self.network = PeerNetwork(self.profile, self.events)
         self.setWindowTitle(f'LanChat {APP_VERSION}'); self.resize(900, 590)
-        self._build_ui(); self._setup_tray(); self.apply_theme(); self.network.start()
+        self._build_ui(); self._setup_tray(); self.apply_theme(); self.apply_window_flags(); self.network.start()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_peers); self.timer.start(2500)
 
     def _build_ui(self):
@@ -257,8 +269,13 @@ class LanChat(QMainWindow):
         top.addWidget(title); top.addStretch(); top.addWidget(self.status); top.addWidget(settings); top.addWidget(about); main.addLayout(top)
         body = QHBoxLayout(); main.addLayout(body, 1)
         left = QVBoxLayout(); left.addWidget(QLabel('کاربران آنلاین (کشف خودکار)'))
+        group_row = QHBoxLayout(); self.group_filter = QComboBox(); self.group_filter.addItem('همه کاربران', '__all__'); self.group_filter.currentIndexChanged.connect(self.refresh_peers); group_row.addWidget(self.group_filter, 1)
+        add_group = QPushButton('گروه جدید'); add_group.clicked.connect(self.create_group); group_row.addWidget(add_group)
+        assign_group = QPushButton('گروه‌بندی کاربر'); assign_group.clicked.connect(self.assign_group); group_row.addWidget(assign_group); left.addLayout(group_row)
         self.users = QListWidget(); self.users.currentItemChanged.connect(self.select_peer); left.addWidget(self.users)
         self.refresh_btn = QPushButton('به‌روزرسانی فهرست'); self.refresh_btn.clicked.connect(self.refresh_peers); left.addWidget(self.refresh_btn)
+        self.broadcast_btn = QPushButton('ارسال پیام به همه کاربران'); self.broadcast_btn.clicked.connect(self.send_to_all); left.addWidget(self.broadcast_btn)
+        self.group_send_btn = QPushButton('ارسال پیام به گروه انتخاب‌شده'); self.group_send_btn.clicked.connect(self.send_to_group); left.addWidget(self.group_send_btn)
         body.addLayout(left, 1)
         right = QVBoxLayout(); self.chat_title = QLabel('برای شروع، یک کاربر آنلاین انتخاب کن')
         self.chat = QTextEdit(); self.chat.setReadOnly(True); self.chat.setPlaceholderText('پیام‌های این گفت‌وگو در همین رایانه ذخیره می‌شوند.')
@@ -275,16 +292,31 @@ class LanChat(QMainWindow):
         self.tray.setContextMenu(menu); self.tray.activated.connect(lambda reason: self.showNormal() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
         if QSystemTrayIcon.isSystemTrayAvailable(): self.tray.show()
 
+    def apply_window_flags(self):
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(self.profile.get('always_on_top', False)))
+        if self.isVisible(): self.show()
+
     def apply_theme(self):
+        # Keep the selected font consistent across the whole interface.
+        font = QFont(str(self.profile.get('font_family', 'Segoe UI')), int(self.profile.get('font_size', 10)))
+        QApplication.instance().setFont(font)
         if self.profile.get('theme') == 'light':
-            self.setStyleSheet('QMainWindow,QWidget{background:#f3f5f7;color:#17202a} QPushButton{background:#dce6f1;color:#17202a;padding:7px;border-radius:5px} QListWidget,QTextEdit,QLineEdit{background:white;color:#17202a;border:1px solid #aab7c4;padding:5px}')
+            self.setStyleSheet('QMainWindow,QWidget{background:#f3f5f7;color:#17202a} QPushButton{background:#dce6f1;color:#17202a;padding:7px;border-radius:5px} QListWidget,QTextEdit,QLineEdit,QComboBox{background:white;color:#17202a;border:1px solid #aab7c4;padding:5px}')
         else:
-            self.setStyleSheet('QMainWindow,QWidget{background:#20252b;color:#edf2f7} QPushButton{background:#354b60;color:white;padding:7px;border-radius:5px} QListWidget,QTextEdit,QLineEdit{background:#15191e;color:#edf2f7;border:1px solid #485461;padding:5px} QListWidget::item:selected{background:#236b8e}')
+            self.setStyleSheet('QMainWindow,QWidget{background:#20252b;color:#edf2f7} QPushButton{background:#354b60;color:white;padding:7px;border-radius:5px} QListWidget,QTextEdit,QLineEdit,QComboBox{background:#15191e;color:#edf2f7;border:1px solid #485461;padding:5px} QListWidget::item:selected{background:#236b8e}')
 
     def set_status(self, text): self.status.setText(text)
 
     def refresh_peers(self):
         peers = sorted(self.network.get_peers(), key=lambda p:p['name'].casefold())
+        current_group = self.group_filter.currentData() if hasattr(self, 'group_filter') else '__all__'
+        groups = self.profile.get('groups', ['عمومی'])
+        if hasattr(self, 'group_filter'):
+            old = self.group_filter.currentData(); self.group_filter.blockSignals(True); self.group_filter.clear(); self.group_filter.addItem('همه کاربران', '__all__')
+            for group in groups: self.group_filter.addItem(group, group)
+            idx = self.group_filter.findData(old if old is not None else current_group); self.group_filter.setCurrentIndex(max(0, idx)); self.group_filter.blockSignals(False)
+            current_group = self.group_filter.currentData()
+        if current_group and current_group != '__all__': peers = [p for p in peers if self.profile.get('peer_groups', {}).get(p['id'], 'عمومی') == current_group]
         selected_id = self.selected_peer['id'] if self.selected_peer else None
         self.users.blockSignals(True); self.users.clear(); selected_item = None
         for p in peers:
@@ -294,6 +326,62 @@ class LanChat(QMainWindow):
         self.users.blockSignals(False)
         if not peers: self.set_status('هنوز کاربری پیدا نشده؛ شبکه و فایروال ویندوز را بررسی کن.')
         else: self.set_status(f'{len(peers)} کاربر آنلاین')
+
+    def create_group(self):
+        name, ok = QInputDialog.getText(self, 'گروه جدید', 'نام گروه:')
+        name = name.strip()
+        if ok and name:
+            groups = self.profile.setdefault('groups', ['عمومی'])
+            if name not in groups: groups.append(name); save_profile(self.profile)
+            self.refresh_peers()
+            idx = self.group_filter.findData(name)
+            if idx >= 0: self.group_filter.setCurrentIndex(idx)
+
+    def assign_group(self):
+        if not self.selected_peer:
+            QMessageBox.information(self, 'گروه‌بندی', 'ابتدا یک کاربر آنلاین انتخاب کن.'); return
+        groups = self.profile.setdefault('groups', ['عمومی'])
+        group, ok = QInputDialog.getItem(self, 'گروه‌بندی کاربر', 'انتقال کاربر به گروه:', groups, 0, False)
+        if ok and group:
+            self.profile.setdefault('peer_groups', {})[self.selected_peer['id']] = group
+            save_profile(self.profile); self.refresh_peers()
+
+    def _send_async(self, peers, text, label):
+        if not peers or not text.strip(): return
+        self.entry.clear()
+        self.set_status(f'در حال ارسال به {len(peers)} کاربر…')
+        def worker():
+            errors = []; ok_count = 0
+            def send_one(peer):
+                self.network.send_message(peer, text)
+                if self.profile.get('save_messages', True):
+                    save_message(f"به {peer['name']} ({peer['ip']}) [{label}]: {text}")
+                return peer['name']
+            with ThreadPoolExecutor(max_workers=min(12, len(peers))) as pool:
+                futures = {pool.submit(send_one, peer): peer for peer in peers}
+                for future in as_completed(futures):
+                    try: future.result(); ok_count += 1
+                    except OSError as exc: errors.append(f"{futures[future]['name']}: {exc}")
+            self.events.status.emit(f'ارسال تمام شد: {ok_count}/{len(peers)} کاربر')
+            if errors: self.events.status.emit(f'ارسال به {len(errors)} کاربر ناموفق بود؛ آنلاین بودن و فایروال را بررسی کن.')
+        threading.Thread(target=worker, daemon=True).start()
+
+    def send_to_all(self):
+        text = self.entry.text().strip()
+        if not text: QMessageBox.information(self, 'پیام همگانی', 'ابتدا متن پیام را بنویس.'); return
+        peers = self.network.get_peers()
+        if not peers: QMessageBox.information(self, 'پیام همگانی', 'کاربر آنلاینی پیدا نشده است.'); return
+        self._send_async(peers, text, 'همگانی')
+
+    def send_to_group(self):
+        group = self.group_filter.currentData()
+        if not group or group == '__all__':
+            QMessageBox.information(self, 'ارسال گروهی', 'ابتدا یک گروه مشخص را از فهرست گروه‌ها انتخاب کن.'); return
+        text = self.entry.text().strip()
+        if not text: QMessageBox.information(self, 'ارسال گروهی', 'ابتدا متن پیام را بنویس.'); return
+        peers = [p for p in self.network.get_peers() if self.profile.get('peer_groups', {}).get(p['id'], 'عمومی') == group]
+        if not peers: QMessageBox.information(self, 'ارسال گروهی', 'در این گروه کاربر آنلاینی وجود ندارد.'); return
+        self._send_async(peers, text, f'گروه {group}')
 
     def select_peer(self, current, previous=None):
         if not current: return
@@ -311,15 +399,14 @@ class LanChat(QMainWindow):
         text = self.entry.text().strip()
         if not text: return
         peer = dict(self.selected_peer)
-        try:
-            self.network.send_message(peer, text)
-            stamp = datetime.now().strftime('%H:%M:%S')
-            line = f'[{stamp}] من: {text}'; self.append_chat(peer['id'], line)
-            if self.profile.get('save_messages', True): save_message(f"به {peer['name']} ({peer['ip']}): {text}")
-            self.entry.clear()
-        except OSError as e:
-            QMessageBox.warning(self, 'ارسال ناموفق', f'پیام ارسال نشد. بررسی کن کاربر هنوز آنلاین باشد و فایروال اجازه ارتباط بدهد.\n\nجزئیات: {e}')
-            self.refresh_peers()
+        self.entry.clear()
+        stamp = datetime.now().strftime('%H:%M:%S')
+        line = f'[{stamp}] من: {text}'; self.append_chat(peer['id'], line)
+        if self.profile.get('save_messages', True): save_message(f"به {peer['name']} ({peer['ip']}): {text}")
+        def worker():
+            try: self.network.send_message(peer, text)
+            except OSError as e: self.events.status.emit(f'ارسال ناموفق به {peer["name"]}: {e}')
+        threading.Thread(target=worker, daemon=True).start()
 
     def receive_message(self, msg):
         peer_id = msg['from']; stamp = msg.get('time','')
@@ -327,14 +414,20 @@ class LanChat(QMainWindow):
         except Exception: stamp = datetime.now().strftime('%H:%M:%S')
         self.append_chat(peer_id, f"[{stamp}] {msg['name']}: {msg['text']}")
         if self.profile.get('save_messages', True): save_message(f"از {msg['name']} ({msg['ip']}): {msg['text']}")
-        if self.profile.get('notifications', True) and (not self.isVisible() or not self.isActiveWindow()):
-            self.tray.showMessage('پیام جدید در LanChat', f"{msg['name']}: {msg['text'][:180]}", QSystemTrayIcon.MessageIcon.Information, 4000)
+        if self.profile.get('notifications', True):
+            if (not self.isVisible() or not self.isActiveWindow()) and QSystemTrayIcon.isSystemTrayAvailable():
+                self.tray.showMessage('پیام جدید در LanChat', f"{msg['name']}: {msg['text'][:180]}", QSystemTrayIcon.MessageIcon.Information, 7000)
+            if self.profile.get('notification_sound', True) and platform.system() == 'Windows':
+                try:
+                    import winsound
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                except Exception: pass
         self.refresh_peers()
 
     def open_settings(self):
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.profile.update(dlg.values()); save_profile(self.profile); self.apply_theme()
+            self.profile.update(dlg.values()); save_profile(self.profile); self.apply_theme(); self.apply_window_flags()
             self.setWindowTitle(f"LanChat {APP_VERSION} — {self.profile['name']}")
 
     def about(self):
