@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
     QSystemTrayIcon, QMenu, QStyle, QDialog, QFormLayout, QCheckBox, QComboBox, QFontComboBox, QSpinBox, QInputDialog)
 
 APP_NAME = 'LanChat'
-APP_VERSION = '1.3.0'
+APP_VERSION = '1.4.0'
 DEVELOPER_EMAIL = 'hamedmohammadinikche@gmail.com'
 TCP_PORT = 39872
 UDP_PORT = 39873
@@ -37,7 +37,7 @@ def load_profile():
     p.setdefault('font_size', 10)
     p.setdefault('peer_groups', {})
     p.setdefault('groups', ['عمومی'])
-    p.setdefault('close_to_tray', False)
+    p.setdefault('close_to_tray', True)
     return p
 
 
@@ -258,7 +258,7 @@ class LanChat(QMainWindow):
         self.events.message_received.connect(self.receive_message); self.events.status.connect(self.set_status)
         self.network = PeerNetwork(self.profile, self.events)
         self.setWindowTitle(f'LanChat {APP_VERSION}'); self.resize(900, 590)
-        self._build_ui(); self._setup_tray(); self.apply_theme(); self.apply_window_flags(); self.network.start()
+        self._build_ui(); self._setup_tray(); self._setup_notification_popup(); self.apply_theme(); self.apply_window_flags(); self.network.start()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_peers); self.timer.start(2500)
 
     def _build_ui(self):
@@ -287,10 +287,62 @@ class LanChat(QMainWindow):
     def _setup_tray(self):
         self.tray = QSystemTrayIcon(self)
         self.tray.setIcon(self.windowIcon() if not self.windowIcon().isNull() else self.style().standardIcon(QStyle.SP_ComputerIcon))
-        menu = QMenu(); show = menu.addAction('نمایش LanChat'); show.triggered.connect(self.showNormal)
-        quit_action = menu.addAction('خروج'); quit_action.triggered.connect(self.quit_app)
-        self.tray.setContextMenu(menu); self.tray.activated.connect(lambda reason: self.showNormal() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        menu = QMenu(); show = menu.addAction('نمایش LanChat'); show.triggered.connect(self.restore_window)
+        menu.addSeparator()
+        quit_action = menu.addAction('خروج کامل'); quit_action.triggered.connect(self.quit_app)
+        self.tray.setContextMenu(menu); self.tray.activated.connect(lambda reason: self.restore_window() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
         if QSystemTrayIcon.isSystemTrayAvailable(): self.tray.show()
+
+    def _setup_notification_popup(self):
+        # A native tray balloon is not guaranteed to appear on every Windows setup.
+        # This lightweight in-app toast is a fallback, independent of Windows toast settings.
+        self.toast = QWidget(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.toast.setObjectName('LanChatToast')
+        self.toast.setFixedWidth(340)
+        toast_layout = QVBoxLayout(self.toast)
+        toast_layout.setContentsMargins(14, 10, 14, 12)
+        self.toast_title = QLabel('پیام جدید در LanChat')
+        self.toast_title.setStyleSheet('font-weight:700;font-size:14px;')
+        self.toast_text = QLabel('')
+        self.toast_text.setWordWrap(True)
+        toast_layout.addWidget(self.toast_title)
+        toast_layout.addWidget(self.toast_text)
+        self.toast.setStyleSheet('#LanChatToast{background:#17283b;color:#ffffff;border:1px solid #2196f3;border-radius:10px;} QLabel{background:transparent;color:#ffffff;}')
+        self.toast_timer = QTimer(self); self.toast_timer.setSingleShot(True); self.toast_timer.timeout.connect(self.toast.hide)
+
+    def restore_window(self):
+        self.showNormal(); self.raise_(); self.activateWindow()
+
+    def show_notification(self, sender, text):
+        if not self.profile.get('notifications', True):
+            return
+        title = f'پیام جدید از {sender}'
+        body = str(text)[:220]
+        # Prefer native Windows notification through Qt tray; use a visible fallback popup too.
+        try:
+            if QSystemTrayIcon.isSystemTrayAvailable() and self.tray.isVisible():
+                self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 8000)
+        except Exception:
+            pass
+        try:
+            self.toast_title.setText(title)
+            self.toast_text.setText(body)
+            screen = QApplication.primaryScreen()
+            if screen:
+                area = screen.availableGeometry()
+                self.toast.adjustSize()
+                self.toast.move(area.right() - self.toast.width() - 18, area.top() + 18)
+            self.toast.show(); self.toast.raise_()
+            self.toast_timer.start(8000)
+        except Exception:
+            pass
+        if self.profile.get('notification_sound', True) and platform.system() == 'Windows':
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            except Exception:
+                try: QApplication.beep()
+                except Exception: pass
 
     def apply_window_flags(self):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(self.profile.get('always_on_top', False)))
@@ -414,14 +466,8 @@ class LanChat(QMainWindow):
         except Exception: stamp = datetime.now().strftime('%H:%M:%S')
         self.append_chat(peer_id, f"[{stamp}] {msg['name']}: {msg['text']}")
         if self.profile.get('save_messages', True): save_message(f"از {msg['name']} ({msg['ip']}): {msg['text']}")
-        if self.profile.get('notifications', True):
-            if (not self.isVisible() or not self.isActiveWindow()) and QSystemTrayIcon.isSystemTrayAvailable():
-                self.tray.showMessage('پیام جدید در LanChat', f"{msg['name']}: {msg['text'][:180]}", QSystemTrayIcon.MessageIcon.Information, 7000)
-            if self.profile.get('notification_sound', True) and platform.system() == 'Windows':
-                try:
-                    import winsound
-                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                except Exception: pass
+        if not self.isActiveWindow():
+            self.show_notification(msg['name'], msg['text'])
         self.refresh_peers()
 
     def open_settings(self):
@@ -434,17 +480,20 @@ class LanChat(QMainWindow):
         QMessageBox.about(self, 'درباره LanChat', f'<h3>LanChat {APP_VERSION}</h3><p>پیام‌رسان مستقیم در شبکه محلی، بدون مدیر یا سرور مرکزی.</p><p>توسعه‌دهنده: حامد محمدی</p><p>ایمیل: <a href="mailto:{DEVELOPER_EMAIL}">{DEVELOPER_EMAIL}</a></p><p>پیام‌ها فقط در رایانه‌های فرستنده و گیرنده ذخیره می‌شوند (در صورت فعال بودن ذخیره پیام).</p>')
 
     def closeEvent(self, event):
-        if self.profile.get('close_to_tray', False) and self.tray.isVisible():
+        if self.tray.isVisible():
             self.hide(); event.ignore()
+            if self.profile.get('notifications', True):
+                try: self.tray.showMessage('LanChat فعال است', 'برنامه در کنار ساعت ویندوز اجرا می‌شود.', QSystemTrayIcon.MessageIcon.Information, 2500)
+                except Exception: pass
         else:
             self.network.stop(); event.accept()
 
     def quit_app(self):
-        self.network.stop(); self.tray.hide(); QApplication.quit()
+        self.network.stop(); self.toast.hide(); self.tray.hide(); QApplication.quit()
 
 
 def main():
-    app = QApplication(sys.argv); app.setApplicationName(APP_NAME)
+    app = QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setQuitOnLastWindowClosed(False)
     try:
         icon = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'lanchat.ico'
         if icon.exists(): app.setWindowIcon(QIcon(str(icon)))
