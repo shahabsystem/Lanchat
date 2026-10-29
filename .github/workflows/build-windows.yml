@@ -34,6 +34,6 @@ jobs:
           main.py
       - uses: actions/upload-artifact@v4
         with:
-          name: LanChat-Windows-1.2.0
+          name: LanChat-Windows-1.3.0
           path: dist/LanChat.exe
           if-no-files-found: error
