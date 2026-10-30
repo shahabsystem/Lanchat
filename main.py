@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
     QSystemTrayIcon, QMenu, QStyle, QDialog, QFormLayout, QCheckBox, QComboBox, QFontComboBox, QSpinBox, QInputDialog)
 
 APP_NAME = 'LanChat'
-APP_VERSION = '1.5.0'
+APP_VERSION = '1.6.0'
 DEVELOPER_EMAIL = 'hamedmohammadinikche@gmail.com'
 TCP_PORT = 39872
 UDP_PORT = 39873
@@ -28,12 +28,12 @@ def load_profile():
     except Exception: p = {}
     p.setdefault('id', str(uuid.uuid4()))
     p.setdefault('name', socket.gethostname())
-    p.setdefault('theme', 'dark')
+    p.setdefault('theme', 'terminal')
     p.setdefault('save_messages', True)
     p.setdefault('notifications', True)
     p.setdefault('notification_sound', True)
     p.setdefault('always_on_top', False)
-    p.setdefault('font_family', 'Segoe UI')
+    p.setdefault('font_family', 'Tahoma')
     p.setdefault('font_size', 10)
     p.setdefault('peer_groups', {})
     p.setdefault('groups', ['عمومی'])
@@ -257,8 +257,8 @@ class SettingsDialog(QDialog):
         self.setWindowTitle('تنظیمات LanChat'); self.setMinimumWidth(390)
         layout = QVBoxLayout(self); form = QFormLayout()
         self.name = QLineEdit(parent.profile.get('name',''))
-        self.theme = QComboBox(); self.theme.addItem('تیره', 'dark'); self.theme.addItem('روشن', 'light')
-        self.theme.setCurrentIndex(0 if parent.profile.get('theme','dark') == 'dark' else 1)
+        self.theme = QComboBox(); self.theme.addItem('Command Prompt (سیاه ترمینال)', 'terminal'); self.theme.addItem('تیره', 'dark'); self.theme.addItem('روشن', 'light')
+        self.theme.setCurrentIndex(max(0, self.theme.findData(parent.profile.get('theme', 'terminal'))))
         self.save_logs = QCheckBox('ذخیره پیام‌های ارسالی و دریافتی در این رایانه')
         self.save_logs.setChecked(parent.profile.get('save_messages', True))
         self.notifications = QCheckBox('نمایش اعلان پیام جدید'); self.notifications.setChecked(parent.profile.get('notifications', True))
@@ -266,7 +266,8 @@ class SettingsDialog(QDialog):
         self.topmost = QCheckBox('قرار گرفتن پنجره روی همه برنامه‌ها'); self.topmost.setChecked(parent.profile.get('always_on_top', False))
         self.startup = QCheckBox('اجرای خودکار پس از ورود به ویندوز'); self.startup.setChecked(parent.profile.get('start_with_windows', False))
         self.toast_duration = QSpinBox(); self.toast_duration.setRange(2, 60); self.toast_duration.setSuffix(' ثانیه'); self.toast_duration.setValue(int(parent.profile.get('notification_duration', 8)))
-        self.font = QFontComboBox(); self.font.setCurrentFont(QFont(parent.profile.get('font_family', 'Segoe UI')))
+        self.font = QFontComboBox(); self.font.setCurrentFont(QFont(parent.profile.get('font_family', 'Tahoma')))
+        if not parent.profile.get('font_family'): self.font.setCurrentFont(QFont('Tahoma'))
         self.font_size = QSpinBox(); self.font_size.setRange(8, 28); self.font_size.setValue(int(parent.profile.get('font_size', 10)))
         form.addRow('نام نمایشی:', self.name); form.addRow('پوسته:', self.theme); form.addRow('فونت:', self.font); form.addRow('اندازه فونت:', self.font_size)
         form.addRow('مدت نمایش اعلان:', self.toast_duration)
@@ -388,13 +389,60 @@ class LanChat(QMainWindow):
         if self.isVisible(): self.show()
 
     def apply_theme(self):
-        # Keep the selected font consistent across the whole interface.
-        font = QFont(str(self.profile.get('font_family', 'Segoe UI')), int(self.profile.get('font_size', 10)))
+        # Terminal-inspired palette, with Tahoma for reliable Persian glyph coverage.
+        font = QFont(str(self.profile.get('font_family', 'Tahoma')), int(self.profile.get('font_size', 10)))
         QApplication.instance().setFont(font)
-        if self.profile.get('theme') == 'light':
-            self.setStyleSheet('QMainWindow,QWidget{background:#f3f5f7;color:#17202a} QPushButton{background:#dce6f1;color:#17202a;padding:7px;border-radius:5px} QListWidget,QTextEdit,QLineEdit,QComboBox{background:white;color:#17202a;border:1px solid #aab7c4;padding:5px}')
+        theme = self.profile.get('theme', 'terminal')
+        if theme == 'light':
+            style = '''
+                QWidget { background:#F3F5F7; color:#17202A; }
+                QMainWindow { background:#F3F5F7; }
+                QPushButton { background:#DCE6F1; color:#17202A; border:1px solid #AAB7C4; padding:7px 10px; }
+                QPushButton:hover { background:#C8D8E8; }
+                QListWidget,QTextEdit,QLineEdit,QComboBox { background:#FFFFFF; color:#17202A; border:1px solid #AAB7C4; padding:5px; selection-background-color:#316AC5; selection-color:#FFFFFF; }
+                QMenu { background:#FFFFFF; color:#17202A; border:1px solid #AAB7C4; }
+                QMenu::item:selected { background:#316AC5; color:#FFFFFF; }
+                QCheckBox,QLabel { background:transparent; }
+            '''
+        elif theme == 'dark':
+            style = '''
+                QWidget { background:#20252B; color:#EDF2F7; }
+                QMainWindow { background:#20252B; }
+                QPushButton { background:#354B60; color:#FFFFFF; border:1px solid #485461; padding:7px 10px; }
+                QPushButton:hover { background:#42627D; }
+                QListWidget,QTextEdit,QLineEdit,QComboBox { background:#15191E; color:#EDF2F7; border:1px solid #485461; padding:5px; selection-background-color:#236B8E; selection-color:#FFFFFF; }
+                QMenu { background:#20252B; color:#EDF2F7; border:1px solid #485461; }
+                QMenu::item:selected { background:#236B8E; }
+                QCheckBox,QLabel { background:transparent; }
+            '''
         else:
-            self.setStyleSheet('QMainWindow,QWidget{background:#20252b;color:#edf2f7} QPushButton{background:#354b60;color:white;padding:7px;border-radius:5px} QListWidget,QTextEdit,QLineEdit,QComboBox{background:#15191e;color:#edf2f7;border:1px solid #485461;padding:5px} QListWidget::item:selected{background:#236b8e}')
+            # Windows Command Prompt-like: true black canvas, compact flat controls,
+            # classic light-gray text and blue selection. Tahoma is intentionally used
+            # instead of Consolas so Persian text renders consistently.
+            style = '''
+                QWidget { background:#0C0C0C; color:#CCCCCC; }
+                QMainWindow { background:#0C0C0C; }
+                QDialog { background:#0C0C0C; }
+                QLabel { background:transparent; color:#CCCCCC; }
+                QPushButton { background:#0C0C0C; color:#CCCCCC; border:1px solid #666666; border-radius:0px; padding:6px 9px; }
+                QPushButton:hover { background:#1F1F1F; color:#FFFFFF; border:1px solid #AAAAAA; }
+                QPushButton:pressed { background:#333333; }
+                QListWidget,QTextEdit,QLineEdit,QComboBox { background:#0C0C0C; color:#CCCCCC; border:1px solid #666666; border-radius:0px; padding:5px; selection-background-color:#264F78; selection-color:#FFFFFF; }
+                QListWidget::item { padding:3px; }
+                QListWidget::item:selected { background:#264F78; color:#FFFFFF; }
+                QComboBox QAbstractItemView { background:#0C0C0C; color:#CCCCCC; selection-background-color:#264F78; }
+                QCheckBox { background:transparent; color:#CCCCCC; spacing:7px; }
+                QCheckBox::indicator { width:13px; height:13px; background:#0C0C0C; border:1px solid #AAAAAA; }
+                QCheckBox::indicator:checked { background:#CCCCCC; border:1px solid #CCCCCC; }
+                QSpinBox { background:#0C0C0C; color:#CCCCCC; border:1px solid #666666; padding:4px; }
+                QMenu { background:#0C0C0C; color:#CCCCCC; border:1px solid #666666; }
+                QMenu::item { padding:5px 24px; }
+                QMenu::item:selected { background:#264F78; color:#FFFFFF; }
+                QScrollBar:vertical { background:#0C0C0C; width:12px; }
+                QScrollBar::handle:vertical { background:#555555; min-height:20px; }
+                QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0px; }
+            '''
+        QApplication.instance().setStyleSheet(style)
 
     def set_status(self, text): self.status.setText(text)
 
