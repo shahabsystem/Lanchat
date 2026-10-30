@@ -1,4 +1,4 @@
-import sys, os, json, socket, threading, time, uuid, struct, logging, platform
+import sys, os, json, socket, threading, time, uuid, struct, logging, platform, hashlib, shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
     QSystemTrayIcon, QMenu, QStyle, QDialog, QFormLayout, QCheckBox, QComboBox, QFontComboBox, QSpinBox, QInputDialog)
 
 APP_NAME = 'LanChat'
-APP_VERSION = '1.4.0'
+APP_VERSION = '1.5.0'
 DEVELOPER_EMAIL = 'hamedmohammadinikche@gmail.com'
 TCP_PORT = 39872
 UDP_PORT = 39873
@@ -38,6 +38,8 @@ def load_profile():
     p.setdefault('peer_groups', {})
     p.setdefault('groups', ['عمومی'])
     p.setdefault('close_to_tray', True)
+    p.setdefault('start_with_windows', False)
+    p.setdefault('notification_duration', 8)
     return p
 
 
@@ -94,6 +96,7 @@ class Events(QObject):
     peers_changed = Signal()
     message_received = Signal(dict)
     status = Signal(str)
+    pause_changed = Signal(float, str)
 
 
 class PeerNetwork:
@@ -105,6 +108,8 @@ class PeerNetwork:
         self.running = False
         self.udp = None
         self.tcp = None
+        self.send_paused_until = 0.0
+        self.pause_reason = ''
 
     def start(self):
         if self.running: return
@@ -137,17 +142,40 @@ class PeerNetwork:
 
     def _handle_connection(self, conn, addr):
         with conn:
-            conn.settimeout(8)
+            conn.settimeout(60)
             try:
                 obj = recv_obj(conn)
                 if not isinstance(obj, dict): return
-                if obj.get('kind') == 'message' and obj.get('to') == self.profile['id']:
+                if obj.get('kind') == 'update_request':
+                    if not getattr(sys, 'frozen', False):
+                        conn.sendall(pack({'ok': False, 'error': 'نسخهٔ اجرایی برای توزیع موجود نیست'})); return
+                    exe_path = Path(sys.executable)
+                    size = exe_path.stat().st_size
+                    if size > 150 * 1024 * 1024:
+                        conn.sendall(pack({'ok': False, 'error': 'حجم فایل به‌روزرسانی بیش از حد مجاز است'})); return
+                    digest = hashlib.sha256(exe_path.read_bytes()).hexdigest()
+                    conn.sendall(pack({'ok': True, 'version': APP_VERSION, 'size': size, 'sha256': digest}))
+                    with exe_path.open('rb') as src:
+                        while True:
+                            chunk = src.read(1024 * 1024)
+                            if not chunk: break
+                            conn.sendall(chunk)
+                elif obj.get('kind') == 'pause_sending':
+                    seconds = max(0, min(120, int(obj.get('seconds', 0))))
+                    if seconds:
+                        self.send_paused_until = max(self.send_paused_until, time.monotonic() + seconds)
+                        self.pause_reason = str(obj.get('name', 'یکی از کاربران'))[:64]
+                        self.events.pause_changed.emit(self.send_paused_until, self.pause_reason)
+                    conn.sendall(pack({'ok': True}))
+                elif obj.get('kind') == 'message' and obj.get('to') == self.profile['id']:
                     sender = str(obj.get('from', ''))
                     if not sender or sender == self.profile['id']: return
+                    if time.monotonic() < self.send_paused_until:
+                        conn.sendall(pack({'ok': False, 'error': 'ارسال پیام در شبکه موقتاً متوقف شده است'})); return
                     message = {'kind':'message', 'from':sender,
                         'name':str(obj.get('name','کاربر'))[:64], 'text':str(obj.get('text',''))[:12000],
                         'time':str(obj.get('time','')), 'ip':addr[0]}
-                    self._update_peer(sender, message['name'], addr[0])
+                    self._update_peer(sender, message['name'], addr[0], str(obj.get('version', 'نامشخص'))[:20])
                     self.events.message_received.emit(message)
                     conn.sendall(pack({'ok': True}))
             except (OSError, ValueError, UnicodeDecodeError): pass
@@ -170,7 +198,7 @@ class PeerNetwork:
                 if not peer_id or peer_id == self.profile['id']: continue
                 name = str(obj.get('name','کاربر'))[:64]
                 ip = addr[0]
-                self._update_peer(peer_id, name, ip)
+                self._update_peer(peer_id, name, ip, str(obj.get('version', 'نامشخص'))[:20])
                 # Unicast reply helps peers on networks where broadcast delivery is asymmetric.
                 try:
                     reply = self._beacon_data()
@@ -180,7 +208,7 @@ class PeerNetwork:
             self.events.status.emit(f'کشف خودکار شبکه در دسترس نیست: {e}')
 
     def _beacon_data(self):
-        return {'kind':BEACON, 'id':self.profile['id'], 'name':str(self.profile.get('name') or socket.gethostname())[:64], 'port':TCP_PORT, 'time':time.time()}
+        return {'kind':BEACON, 'id':self.profile['id'], 'name':str(self.profile.get('name') or socket.gethostname())[:64], 'port':TCP_PORT, 'version':APP_VERSION, 'time':time.time()}
 
     def _beacon_loop(self):
         while self.running:
@@ -195,12 +223,12 @@ class PeerNetwork:
                 if not self.running: break
                 time.sleep(0.1)
 
-    def _update_peer(self, peer_id, name, ip):
+    def _update_peer(self, peer_id, name, ip, version='نامشخص'):
         changed = False
         with self.lock:
             old = self.peers.get(peer_id)
-            if not old or old.get('name') != name or old.get('ip') != ip: changed = True
-            self.peers[peer_id] = {'id':peer_id, 'name':name, 'ip':ip, 'last_seen':time.monotonic()}
+            if not old or old.get('name') != name or old.get('ip') != ip or old.get('version') != version: changed = True
+            self.peers[peer_id] = {'id':peer_id, 'name':name, 'ip':ip, 'version':version, 'last_seen':time.monotonic()}
         if changed: self.events.peers_changed.emit()
 
     def _expire_peers(self):
@@ -216,11 +244,11 @@ class PeerNetwork:
 
     def send_message(self, peer, text):
         request = {'kind':'message', 'from':self.profile['id'], 'to':peer['id'],
-                   'name':str(self.profile.get('name') or socket.gethostname())[:64],
+                   'name':str(self.profile.get('name') or socket.gethostname())[:64], 'version':APP_VERSION,
                    'text':text, 'time':datetime.now().isoformat(timespec='seconds')}
         with socket.create_connection((peer['ip'], TCP_PORT), timeout=3) as s:
             s.settimeout(4); s.sendall(pack(request)); response = recv_obj(s)
-            if not response or not response.get('ok'): raise OSError('پاسخ دریافت نشد')
+            if not response or not response.get('ok'): raise OSError((response or {}).get('error', 'پاسخ دریافت نشد'))
 
 
 class SettingsDialog(QDialog):
@@ -236,10 +264,13 @@ class SettingsDialog(QDialog):
         self.notifications = QCheckBox('نمایش اعلان پیام جدید'); self.notifications.setChecked(parent.profile.get('notifications', True))
         self.sound = QCheckBox('پخش صدای اعلان'); self.sound.setChecked(parent.profile.get('notification_sound', True))
         self.topmost = QCheckBox('قرار گرفتن پنجره روی همه برنامه‌ها'); self.topmost.setChecked(parent.profile.get('always_on_top', False))
+        self.startup = QCheckBox('اجرای خودکار پس از ورود به ویندوز'); self.startup.setChecked(parent.profile.get('start_with_windows', False))
+        self.toast_duration = QSpinBox(); self.toast_duration.setRange(2, 60); self.toast_duration.setSuffix(' ثانیه'); self.toast_duration.setValue(int(parent.profile.get('notification_duration', 8)))
         self.font = QFontComboBox(); self.font.setCurrentFont(QFont(parent.profile.get('font_family', 'Segoe UI')))
         self.font_size = QSpinBox(); self.font_size.setRange(8, 28); self.font_size.setValue(int(parent.profile.get('font_size', 10)))
         form.addRow('نام نمایشی:', self.name); form.addRow('پوسته:', self.theme); form.addRow('فونت:', self.font); form.addRow('اندازه فونت:', self.font_size)
-        layout.addLayout(form); layout.addWidget(self.save_logs); layout.addWidget(self.notifications); layout.addWidget(self.sound); layout.addWidget(self.topmost)
+        form.addRow('مدت نمایش اعلان:', self.toast_duration)
+        layout.addLayout(form); layout.addWidget(self.save_logs); layout.addWidget(self.notifications); layout.addWidget(self.sound); layout.addWidget(self.topmost); layout.addWidget(self.startup)
         buttons = QHBoxLayout(); save = QPushButton('ذخیره'); cancel = QPushButton('انصراف')
         save.clicked.connect(self.accept); cancel.clicked.connect(self.reject); buttons.addWidget(save); buttons.addWidget(cancel)
         layout.addLayout(buttons)
@@ -247,7 +278,7 @@ class SettingsDialog(QDialog):
     def values(self):
         return {'name': self.name.text().strip() or socket.gethostname(), 'theme':self.theme.currentData(),
                 'save_messages':self.save_logs.isChecked(), 'notifications':self.notifications.isChecked(), 'notification_sound':self.sound.isChecked(),
-                'always_on_top':self.topmost.isChecked(), 'font_family':self.font.currentFont().family(), 'font_size':self.font_size.value()}
+                'always_on_top':self.topmost.isChecked(), 'start_with_windows':self.startup.isChecked(), 'notification_duration':self.toast_duration.value(), 'font_family':self.font.currentFont().family(), 'font_size':self.font_size.value()}
 
 
 class LanChat(QMainWindow):
@@ -256,10 +287,14 @@ class LanChat(QMainWindow):
         self.selected_peer = None; self.chat_history = {}
         self.events = Events(); self.events.peers_changed.connect(self.refresh_peers)
         self.events.message_received.connect(self.receive_message); self.events.status.connect(self.set_status)
+        self.events.pause_changed.connect(self.on_pause_changed)
         self.network = PeerNetwork(self.profile, self.events)
         self.setWindowTitle(f'LanChat {APP_VERSION}'); self.resize(900, 590)
         self._build_ui(); self._setup_tray(); self._setup_notification_popup(); self.apply_theme(); self.apply_window_flags(); self.network.start()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_peers); self.timer.start(2500)
+        self.pause_timer = QTimer(self); self.pause_timer.timeout.connect(self.update_pause_ui); self.pause_timer.start(500)
+        self.update_downloads = set()
+        self.apply_startup_setting()
 
     def _build_ui(self):
         root = QWidget(); self.setCentralWidget(root); main = QVBoxLayout(root)
@@ -275,12 +310,16 @@ class LanChat(QMainWindow):
         self.users = QListWidget(); self.users.currentItemChanged.connect(self.select_peer); left.addWidget(self.users)
         self.refresh_btn = QPushButton('به‌روزرسانی فهرست'); self.refresh_btn.clicked.connect(self.refresh_peers); left.addWidget(self.refresh_btn)
         self.broadcast_btn = QPushButton('ارسال پیام به همه کاربران'); self.broadcast_btn.clicked.connect(self.send_to_all); left.addWidget(self.broadcast_btn)
+        self.pause_btn = QPushButton('توقف موقت ارسال پیام در شبکه'); self.pause_btn.clicked.connect(self.pause_network_sending); left.addWidget(self.pause_btn)
+        self.pause_after_group = QCheckBox('پس از ارسال گروهی، ارسال همه کاربران متوقف شود')
+        self.group_pause_duration = QComboBox(); self.group_pause_duration.addItem('۶۰ ثانیه', 60); self.group_pause_duration.addItem('۱۲۰ ثانیه', 120)
+        pause_row = QHBoxLayout(); pause_row.addWidget(self.pause_after_group); pause_row.addWidget(self.group_pause_duration); left.addLayout(pause_row)
         self.group_send_btn = QPushButton('ارسال پیام به گروه انتخاب‌شده'); self.group_send_btn.clicked.connect(self.send_to_group); left.addWidget(self.group_send_btn)
         body.addLayout(left, 1)
         right = QVBoxLayout(); self.chat_title = QLabel('برای شروع، یک کاربر آنلاین انتخاب کن')
         self.chat = QTextEdit(); self.chat.setReadOnly(True); self.chat.setPlaceholderText('پیام‌های این گفت‌وگو در همین رایانه ذخیره می‌شوند.')
         compose = QHBoxLayout(); self.entry = QLineEdit(); self.entry.setPlaceholderText('پیام بنویس…'); self.entry.returnPressed.connect(self.send_text)
-        send = QPushButton('ارسال'); send.clicked.connect(self.send_text); compose.addWidget(self.entry, 1); compose.addWidget(send)
+        send = QPushButton('ارسال'); send.clicked.connect(self.send_text); self.send_button = send; compose.addWidget(self.entry, 1); compose.addWidget(send)
         right.addWidget(self.chat_title); right.addWidget(self.chat, 1); right.addLayout(compose); body.addLayout(right, 3)
         self.set_status('کشف خودکار فعال است؛ کاربران باید LanChat را باز داشته باشند.')
 
@@ -321,7 +360,7 @@ class LanChat(QMainWindow):
         # Prefer native Windows notification through Qt tray; use a visible fallback popup too.
         try:
             if QSystemTrayIcon.isSystemTrayAvailable() and self.tray.isVisible():
-                self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 8000)
+                self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, int(self.profile.get('notification_duration', 8)) * 1000)
         except Exception:
             pass
         try:
@@ -333,7 +372,7 @@ class LanChat(QMainWindow):
                 self.toast.adjustSize()
                 self.toast.move(area.right() - self.toast.width() - 18, area.top() + 18)
             self.toast.show(); self.toast.raise_()
-            self.toast_timer.start(8000)
+            self.toast_timer.start(int(self.profile.get('notification_duration', 8)) * 1000)
         except Exception:
             pass
         if self.profile.get('notification_sound', True) and platform.system() == 'Windows':
@@ -372,12 +411,51 @@ class LanChat(QMainWindow):
         selected_id = self.selected_peer['id'] if self.selected_peer else None
         self.users.blockSignals(True); self.users.clear(); selected_item = None
         for p in peers:
-            item = QListWidgetItem(f"🟢  {p['name']}   ({p['ip']})"); item.setData(Qt.ItemDataRole.UserRole, p); self.users.addItem(item)
+            item = QListWidgetItem(f"🟢  {p['name']}   ({p['ip']})   |   نسخه {p.get('version', 'نامشخص')}"); item.setData(Qt.ItemDataRole.UserRole, p); self.users.addItem(item)
             if p['id'] == selected_id: selected_item = item
         if selected_item: self.users.setCurrentItem(selected_item)
         self.users.blockSignals(False)
         if not peers: self.set_status('هنوز کاربری پیدا نشده؛ شبکه و فایروال ویندوز را بررسی کن.')
-        else: self.set_status(f'{len(peers)} کاربر آنلاین')
+        else:
+            self.set_status(f'{len(peers)} کاربر آنلاین')
+            self.check_peer_updates(peers)
+
+    def check_peer_updates(self, peers):
+        newer = []
+        def version_tuple(v):
+            try: return tuple(int(x) for x in str(v).split('.')[:3])
+            except Exception: return (0,)
+        for peer in peers:
+            if version_tuple(peer.get('version', '0')) > version_tuple(APP_VERSION):
+                key = (peer['id'], peer.get('version'))
+                if key not in self.update_downloads:
+                    self.update_downloads.add(key); newer.append(peer)
+        for peer in newer:
+            threading.Thread(target=self.download_peer_update, args=(peer,), daemon=True).start()
+
+    def download_peer_update(self, peer):
+        try:
+            request = {'kind': 'update_request', 'from': self.profile['id'], 'version': APP_VERSION}
+            with socket.create_connection((peer['ip'], TCP_PORT), timeout=5) as sock:
+                sock.settimeout(30); sock.sendall(pack(request)); meta = recv_obj(sock)
+                if not meta or not meta.get('ok'): raise OSError((meta or {}).get('error', 'بستهٔ به‌روزرسانی در دسترس نیست'))
+                size = int(meta.get('size', 0)); expected = str(meta.get('sha256', ''))
+                if size <= 0 or size > 150 * 1024 * 1024 or len(expected) != 64: raise OSError('مشخصات بسته معتبر نیست')
+                update_dir = DATA_DIR / 'updates'; update_dir.mkdir(parents=True, exist_ok=True)
+                target = update_dir / f'LanChat-{meta.get("version", "new")}.exe'
+                temp = target.with_suffix('.download')
+                digest = hashlib.sha256(); remaining = size
+                with temp.open('wb') as out:
+                    while remaining:
+                        chunk = sock.recv(min(1024 * 1024, remaining))
+                        if not chunk: raise OSError('دریافت بسته ناقص ماند')
+                        out.write(chunk); digest.update(chunk); remaining -= len(chunk)
+                if digest.hexdigest().lower() != expected.lower():
+                    temp.unlink(missing_ok=True); raise OSError('بررسی صحت فایل به‌روزرسانی ناموفق بود')
+                temp.replace(target)
+                self.events.status.emit(f'نسخهٔ جدید {meta.get("version")} دریافت شد: {target} — برای جایگزینی، برنامه را ببند و فایل جدید را اجرا کن.')
+        except Exception as exc:
+            self.events.status.emit(f'دریافت خودکار به‌روزرسانی از {peer.get("name", "کاربر") } ناموفق بود: {exc}')
 
     def create_group(self):
         name, ok = QInputDialog.getText(self, 'گروه جدید', 'نام گروه:')
@@ -397,6 +475,35 @@ class LanChat(QMainWindow):
         if ok and group:
             self.profile.setdefault('peer_groups', {})[self.selected_peer['id']] = group
             save_profile(self.profile); self.refresh_peers()
+
+    def on_pause_changed(self, until, reason):
+        self.set_status(f'ارسال پیام تا {max(0, int(until-time.monotonic()))} ثانیه متوقف است (درخواست {reason})')
+        self.update_pause_ui()
+
+    def update_pause_ui(self):
+        remaining = max(0, int(self.network.send_paused_until - time.monotonic()))
+        paused = remaining > 0
+        for widget in (self.entry, self.send_button, self.broadcast_btn, self.group_send_btn):
+            widget.setEnabled(not paused)
+        self.pause_btn.setText(f'ارسال متوقف است ({remaining} ثانیه)' if paused else 'توقف موقت ارسال پیام در شبکه')
+
+    def pause_network_sending(self):
+        choice, ok = QInputDialog.getItem(self, 'توقف موقت ارسال', 'مدت توقف برای همه کاربران آنلاین:', ['۶۰ ثانیه', '۱۲۰ ثانیه'], 0, False)
+        if not ok: return
+        seconds = 60 if choice.startswith('۶۰') else 120
+        peers = self.network.get_peers()
+        self.network.send_paused_until = max(self.network.send_paused_until, time.monotonic()+seconds)
+        self.network.pause_reason = self.profile.get('name', 'کاربر')
+        self.update_pause_ui()
+        def worker():
+            for peer in peers:
+                try:
+                    request = {'kind':'pause_sending', 'seconds':seconds, 'name':self.profile.get('name','کاربر')}
+                    with socket.create_connection((peer['ip'], TCP_PORT), timeout=2) as sock:
+                        sock.settimeout(3); sock.sendall(pack(request)); recv_obj(sock)
+                except OSError: pass
+        threading.Thread(target=worker, daemon=True).start()
+        self.set_status(f'درخواست توقف ارسال برای {len(peers)} کاربر آنلاین ارسال شد؛ {seconds} ثانیه')
 
     def _send_async(self, peers, text, label):
         if not peers or not text.strip(): return
@@ -419,6 +526,8 @@ class LanChat(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def send_to_all(self):
+        if time.monotonic() < self.network.send_paused_until:
+            QMessageBox.information(self, 'ارسال موقتاً متوقف است', 'در این مدت امکان ارسال پیام وجود ندارد.'); return
         text = self.entry.text().strip()
         if not text: QMessageBox.information(self, 'پیام همگانی', 'ابتدا متن پیام را بنویس.'); return
         peers = self.network.get_peers()
@@ -426,6 +535,8 @@ class LanChat(QMainWindow):
         self._send_async(peers, text, 'همگانی')
 
     def send_to_group(self):
+        if time.monotonic() < self.network.send_paused_until:
+            QMessageBox.information(self, 'ارسال موقتاً متوقف است', 'در این مدت امکان ارسال پیام وجود ندارد.'); return
         group = self.group_filter.currentData()
         if not group or group == '__all__':
             QMessageBox.information(self, 'ارسال گروهی', 'ابتدا یک گروه مشخص را از فهرست گروه‌ها انتخاب کن.'); return
@@ -434,6 +545,19 @@ class LanChat(QMainWindow):
         peers = [p for p in self.network.get_peers() if self.profile.get('peer_groups', {}).get(p['id'], 'عمومی') == group]
         if not peers: QMessageBox.information(self, 'ارسال گروهی', 'در این گروه کاربر آنلاینی وجود ندارد.'); return
         self._send_async(peers, text, f'گروه {group}')
+        if self.pause_after_group.isChecked():
+            seconds = int(self.group_pause_duration.currentData())
+            self.network.send_paused_until = max(self.network.send_paused_until, time.monotonic()+seconds)
+            self.network.pause_reason = self.profile.get('name', 'کاربر')
+            self.update_pause_ui()
+            def pause_worker():
+                for peer in self.network.get_peers():
+                    try:
+                        req = {'kind':'pause_sending', 'seconds':seconds, 'name':self.profile.get('name','کاربر')}
+                        with socket.create_connection((peer['ip'], TCP_PORT), timeout=2) as sock:
+                            sock.settimeout(3); sock.sendall(pack(req)); recv_obj(sock)
+                    except OSError: pass
+            threading.Thread(target=pause_worker, daemon=True).start()
 
     def select_peer(self, current, previous=None):
         if not current: return
@@ -446,6 +570,8 @@ class LanChat(QMainWindow):
         if self.selected_peer and self.selected_peer['id'] == peer_id: self.chat.append(line)
 
     def send_text(self):
+        if time.monotonic() < self.network.send_paused_until:
+            QMessageBox.information(self, 'ارسال موقتاً متوقف است', 'در این مدت امکان ارسال پیام وجود ندارد.'); return
         if not self.selected_peer:
             QMessageBox.information(self, 'انتخاب کاربر', 'ابتدا یک کاربر آنلاین از فهرست انتخاب کن.'); return
         text = self.entry.text().strip()
@@ -470,10 +596,27 @@ class LanChat(QMainWindow):
             self.show_notification(msg['name'], msg['text'])
         self.refresh_peers()
 
+    def apply_startup_setting(self):
+        if platform.system() != 'Windows': return
+        try:
+            import winreg
+            key_path = r'Software\Microsoft\Windows\CurrentVersion\Run'
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+                value_name = 'LanChat'
+                if self.profile.get('start_with_windows', False):
+                    if getattr(sys, 'frozen', False): command = f'"{sys.executable}"'
+                    else: command = f'"{sys.executable}" "{Path(__file__).resolve()}"'
+                    winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
+                else:
+                    try: winreg.DeleteValue(key, value_name)
+                    except FileNotFoundError: pass
+        except Exception as exc:
+            self.events.status.emit(f'تنظیم اجرای خودکار ویندوز انجام نشد: {exc}')
+
     def open_settings(self):
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.profile.update(dlg.values()); save_profile(self.profile); self.apply_theme(); self.apply_window_flags()
+            self.profile.update(dlg.values()); save_profile(self.profile); self.apply_startup_setting(); self.apply_theme(); self.apply_window_flags()
             self.setWindowTitle(f"LanChat {APP_VERSION} — {self.profile['name']}")
 
     def about(self):
