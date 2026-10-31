@@ -7,10 +7,10 @@ from PySide6.QtGui import QIcon, QDesktopServices, QFont
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QTextEdit, QLineEdit, QPushButton, QMessageBox,
-    QSystemTrayIcon, QMenu, QStyle, QDialog, QFormLayout, QCheckBox, QComboBox, QFontComboBox, QSpinBox, QInputDialog)
+    QSystemTrayIcon, QMenu, QStyle, QDialog, QFormLayout, QCheckBox, QComboBox, QFontComboBox, QSpinBox, QInputDialog, QColorDialog)
 
 APP_NAME = 'LanChat'
-APP_VERSION = '1.6.0'
+APP_VERSION = '1.7.0'
 DEVELOPER_EMAIL = 'hamedmohammadinikche@gmail.com'
 TCP_PORT = 39872
 UDP_PORT = 39873
@@ -39,7 +39,9 @@ def load_profile():
     p.setdefault('groups', ['عمومی'])
     p.setdefault('close_to_tray', True)
     p.setdefault('start_with_windows', False)
-    p.setdefault('notification_duration', 8)
+    p.setdefault('notification_duration', 20)
+    p.setdefault('ui_bg_color', '#0C0C0C')
+    p.setdefault('ui_text_color', '#CCCCCC')
     return p
 
 
@@ -174,7 +176,7 @@ class PeerNetwork:
                         conn.sendall(pack({'ok': False, 'error': 'ارسال پیام در شبکه موقتاً متوقف شده است'})); return
                     message = {'kind':'message', 'from':sender,
                         'name':str(obj.get('name','کاربر'))[:64], 'text':str(obj.get('text',''))[:12000],
-                        'time':str(obj.get('time','')), 'ip':addr[0]}
+                        'category':str(obj.get('category','direct'))[:24], 'time':str(obj.get('time','')), 'ip':addr[0]}
                     self._update_peer(sender, message['name'], addr[0], str(obj.get('version', 'نامشخص'))[:20])
                     self.events.message_received.emit(message)
                     conn.sendall(pack({'ok': True}))
@@ -242,10 +244,10 @@ class PeerNetwork:
     def get_peers(self):
         with self.lock: return [dict(p) for p in self.peers.values()]
 
-    def send_message(self, peer, text):
+    def send_message(self, peer, text, category='direct'):
         request = {'kind':'message', 'from':self.profile['id'], 'to':peer['id'],
                    'name':str(self.profile.get('name') or socket.gethostname())[:64], 'version':APP_VERSION,
-                   'text':text, 'time':datetime.now().isoformat(timespec='seconds')}
+                   'category':category, 'text':text, 'time':datetime.now().isoformat(timespec='seconds')}
         with socket.create_connection((peer['ip'], TCP_PORT), timeout=3) as s:
             s.settimeout(4); s.sendall(pack(request)); response = recv_obj(s)
             if not response or not response.get('ok'): raise OSError((response or {}).get('error', 'پاسخ دریافت نشد'))
@@ -265,19 +267,31 @@ class SettingsDialog(QDialog):
         self.sound = QCheckBox('پخش صدای اعلان'); self.sound.setChecked(parent.profile.get('notification_sound', True))
         self.topmost = QCheckBox('قرار گرفتن پنجره روی همه برنامه‌ها'); self.topmost.setChecked(parent.profile.get('always_on_top', False))
         self.startup = QCheckBox('اجرای خودکار پس از ورود به ویندوز'); self.startup.setChecked(parent.profile.get('start_with_windows', False))
-        self.toast_duration = QSpinBox(); self.toast_duration.setRange(2, 60); self.toast_duration.setSuffix(' ثانیه'); self.toast_duration.setValue(int(parent.profile.get('notification_duration', 8)))
+        self.toast_duration = QSpinBox(); self.toast_duration.setRange(5, 120); self.toast_duration.setSuffix(' ثانیه'); self.toast_duration.setValue(int(parent.profile.get('notification_duration', 20)))
+        self.bg_color = parent.profile.get('ui_bg_color', '#0C0C0C')
+        self.text_color = parent.profile.get('ui_text_color', '#CCCCCC')
+        self.bg_button = QPushButton(self.bg_color); self.text_button = QPushButton(self.text_color)
+        self.bg_button.clicked.connect(lambda: self.pick_color('bg')); self.text_button.clicked.connect(lambda: self.pick_color('text'))
         self.font = QFontComboBox(); self.font.setCurrentFont(QFont(parent.profile.get('font_family', 'Tahoma')))
         if not parent.profile.get('font_family'): self.font.setCurrentFont(QFont('Tahoma'))
         self.font_size = QSpinBox(); self.font_size.setRange(8, 28); self.font_size.setValue(int(parent.profile.get('font_size', 10)))
         form.addRow('نام نمایشی:', self.name); form.addRow('پوسته:', self.theme); form.addRow('فونت:', self.font); form.addRow('اندازه فونت:', self.font_size)
         form.addRow('مدت نمایش اعلان:', self.toast_duration)
+        form.addRow('رنگ پس‌زمینه پنجره:', self.bg_button); form.addRow('رنگ نوشته‌ها:', self.text_button)
         layout.addLayout(form); layout.addWidget(self.save_logs); layout.addWidget(self.notifications); layout.addWidget(self.sound); layout.addWidget(self.topmost); layout.addWidget(self.startup)
         buttons = QHBoxLayout(); save = QPushButton('ذخیره'); cancel = QPushButton('انصراف')
         save.clicked.connect(self.accept); cancel.clicked.connect(self.reject); buttons.addWidget(save); buttons.addWidget(cancel)
         layout.addLayout(buttons)
 
+    def pick_color(self, which):
+        current = self.bg_color if which == 'bg' else self.text_color
+        color = QColorDialog.getColor(__import__('PySide6.QtGui', fromlist=['QColor']).QColor(current), self, 'انتخاب رنگ')
+        if color.isValid():
+            if which == 'bg': self.bg_color = color.name(); self.bg_button.setText(self.bg_color)
+            else: self.text_color = color.name(); self.text_button.setText(self.text_color)
+
     def values(self):
-        return {'name': self.name.text().strip() or socket.gethostname(), 'theme':self.theme.currentData(),
+        return {'ui_bg_color':self.bg_color, 'ui_text_color':self.text_color, 'name': self.name.text().strip() or socket.gethostname(), 'theme':self.theme.currentData(),
                 'save_messages':self.save_logs.isChecked(), 'notifications':self.notifications.isChecked(), 'notification_sound':self.sound.isChecked(),
                 'always_on_top':self.topmost.isChecked(), 'start_with_windows':self.startup.isChecked(), 'notification_duration':self.toast_duration.value(), 'font_family':self.font.currentFont().family(), 'font_size':self.font_size.value()}
 
@@ -298,7 +312,7 @@ class LanChat(QMainWindow):
         self.apply_startup_setting()
 
     def _build_ui(self):
-        root = QWidget(); self.setCentralWidget(root); main = QVBoxLayout(root)
+        root = QWidget(); root.setObjectName('centralWidget'); self.setCentralWidget(root); main = QVBoxLayout(root)
         top = QHBoxLayout(); title = QLabel('LanChat'); title.setStyleSheet('font-size:22px;font-weight:700;')
         self.status = QLabel('در حال جست‌وجوی کاربران شبکه…'); settings = QPushButton('تنظیمات'); about = QPushButton('درباره برنامه')
         settings.clicked.connect(self.open_settings); about.clicked.connect(self.about)
@@ -347,33 +361,37 @@ class LanChat(QMainWindow):
         self.toast_text.setWordWrap(True)
         toast_layout.addWidget(self.toast_title)
         toast_layout.addWidget(self.toast_text)
-        self.toast.setStyleSheet('#LanChatToast{background:#17283b;color:#ffffff;border:1px solid #2196f3;border-radius:10px;} QLabel{background:transparent;color:#ffffff;}')
+        self.toast.setStyleSheet('#LanChatToast{background:#0C0C0C;color:#CCCCCC;border:1px solid #666666;border-radius:2px;} QLabel{background:transparent;color:#CCCCCC;}')
         self.toast_timer = QTimer(self); self.toast_timer.setSingleShot(True); self.toast_timer.timeout.connect(self.toast.hide)
 
     def restore_window(self):
         self.showNormal(); self.raise_(); self.activateWindow()
 
-    def show_notification(self, sender, text):
+    def show_notification(self, sender, text, category='direct'):
         if not self.profile.get('notifications', True):
             return
-        title = f'پیام جدید از {sender}'
-        body = str(text)[:220]
-        # Prefer native Windows notification through Qt tray; use a visible fallback popup too.
-        try:
-            if QSystemTrayIcon.isSystemTrayAvailable() and self.tray.isVisible():
-                self.tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, int(self.profile.get('notification_duration', 8)) * 1000)
-        except Exception:
-            pass
+        is_group = category in ('group', 'broadcast')
+        prefix = 'پیام همگانی' if category == 'broadcast' else ('پیام گروهی' if category == 'group' else 'پیام جدید')
+        title = f'{prefix} از {sender}'
+        body = str(text)[:1200]
+        # Use our own topmost popup as the primary, readable notification; Windows tray balloons are optional.
         try:
             self.toast_title.setText(title)
-            self.toast_text.setText(body)
+            previous = self.toast_text.text().strip()
+            combined = (previous + ('\n\n' if previous else '') + f'{sender}: {body}')
+            self.toast_text.setText(combined[-6000:])
+            self.toast.adjustSize()
             screen = QApplication.primaryScreen()
             if screen:
                 area = screen.availableGeometry()
-                self.toast.adjustSize()
-                self.toast.move(area.right() - self.toast.width() - 18, area.top() + 18)
+                self.toast.move(area.right() - self.toast.width() - 18, area.bottom() - self.toast.height() - 36)
             self.toast.show(); self.toast.raise_()
-            self.toast_timer.start(int(self.profile.get('notification_duration', 8)) * 1000)
+            self.toast_timer.start(int(self.profile.get('notification_duration', 20)) * 1000)
+        except Exception:
+            logging.exception('Could not show in-app notification popup')
+        try:
+            if QSystemTrayIcon.isSystemTrayAvailable() and self.tray.isVisible():
+                self.tray.showMessage(title, body[:240], QSystemTrayIcon.MessageIcon.Information, int(self.profile.get('notification_duration', 20)) * 1000)
         except Exception:
             pass
         if self.profile.get('notification_sound', True) and platform.system() == 'Windows':
@@ -442,7 +460,13 @@ class LanChat(QMainWindow):
                 QScrollBar::handle:vertical { background:#555555; min-height:20px; }
                 QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0px; }
             '''
+        bg = str(self.profile.get('ui_bg_color', '#0C0C0C'))
+        fg = str(self.profile.get('ui_text_color', '#CCCCCC'))
+        # Keep controls theme-styled while allowing the user to tune the main window and text colors.
+        style += f'\nQMainWindow, QDialog, QWidget#centralWidget {{ background-color: {bg}; }}\nQWidget {{ color: {fg}; }}\n'
         QApplication.instance().setStyleSheet(style)
+        if hasattr(self, 'toast'):
+            self.toast.setStyleSheet(f'#LanChatToast{{background:{bg};color:{fg};border:1px solid {fg};border-radius:2px;}} QLabel{{background:transparent;color:{fg};}}')
 
     def set_status(self, text): self.status.setText(text)
 
@@ -560,7 +584,7 @@ class LanChat(QMainWindow):
         def worker():
             errors = []; ok_count = 0
             def send_one(peer):
-                self.network.send_message(peer, text)
+                self.network.send_message(peer, text, 'broadcast' if label == 'همگانی' else ('group' if label.startswith('گروه ') else 'direct'))
                 if self.profile.get('save_messages', True):
                     save_message(f"به {peer['name']} ({peer['ip']}) [{label}]: {text}")
                 return peer['name']
@@ -640,8 +664,9 @@ class LanChat(QMainWindow):
         except Exception: stamp = datetime.now().strftime('%H:%M:%S')
         self.append_chat(peer_id, f"[{stamp}] {msg['name']}: {msg['text']}")
         if self.profile.get('save_messages', True): save_message(f"از {msg['name']} ({msg['ip']}): {msg['text']}")
-        if not self.isActiveWindow():
-            self.show_notification(msg['name'], msg['text'])
+        category = msg.get('category', 'direct')
+        if category in ('group', 'broadcast') or not self.isActiveWindow():
+            self.show_notification(msg['name'], msg['text'], category)
         self.refresh_peers()
 
     def apply_startup_setting(self):
