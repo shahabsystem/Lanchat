@@ -1,3 +1,8 @@
+"""لان‌چت: پیام‌رسان مستقیم در شبکه محلی.
+
+این فایل نقطهٔ ورود و پیاده‌سازی اصلی برنامه است. راهنمای توسعه‌دهندگان در README.md
+قرار دارد. برای حفظ سادگی پروژه، رابط کاربری، شبکه و تنظیمات در همین فایل نگهداری شده‌اند.
+"""
 import sys, os, json, socket, threading, time, uuid, struct, logging, platform, hashlib, shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -10,13 +15,17 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
     QSystemTrayIcon, QMenu, QStyle, QDialog, QFormLayout, QCheckBox, QComboBox, QFontComboBox, QSpinBox, QInputDialog, QColorDialog)
 
 APP_NAME = 'LanChat'
-APP_VERSION = '1.7.0'
+APP_VERSION = '1.7.1'
 DEVELOPER_EMAIL = 'hamedmohammadinikche@gmail.com'
+# پورت TCP برای دریافت پیام خصوصی/گروهی و فایل اجرایی به‌روزرسانی.
 TCP_PORT = 39872
+# پورت UDP برای اعلام حضور (Beacon) و کشف خودکار رایانه‌های هم‌شبکه.
 UDP_PORT = 39873
 BEACON = 'LANCHAT_PEER_V3'
+# اگر در این مدت از یک همتا Beacon نرسد، از فهرست آنلاین حذف می‌شود.
 ONLINE_TIMEOUT = 12
 MAX_PACKET = 2 * 1024 * 1024
+# اطلاعات هر نصب در پروفایل ویندوز کاربر ذخیره می‌شود؛ پوشهٔ برنامه قابل‌حمل می‌ماند.
 DATA_DIR = Path(os.environ.get('APPDATA', str(Path.home()))) / APP_NAME
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PROFILE_PATH = DATA_DIR / 'profile.json'
@@ -24,6 +33,7 @@ LOG_PATH = DATA_DIR / 'messages.txt'
 
 
 def load_profile():
+    """تنظیمات و شناسهٔ پایدار این رایانه را از profile.json می‌خواند."""
     try: p = json.loads(PROFILE_PATH.read_text(encoding='utf-8'))
     except Exception: p = {}
     p.setdefault('id', str(uuid.uuid4()))
@@ -46,10 +56,12 @@ def load_profile():
 
 
 def save_profile(profile):
+    """تنظیمات را با UTF-8 و حفظ حروف فارسی ذخیره می‌کند."""
     PROFILE_PATH.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 def save_message(line):
+    """یک سطر از تاریخچه را فقط در فایل محلی همین رایانه ثبت می‌کند."""
     try:
         with LOG_PATH.open('a', encoding='utf-8') as f:
             f.write(f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}] {line}\n')
@@ -58,6 +70,7 @@ def save_message(line):
 
 
 def pack(obj):
+    """دادهٔ JSON را با پیشوند طول ۴ بایتی آمادهٔ ارسال روی TCP می‌کند."""
     data = json.dumps(obj, ensure_ascii=False).encode('utf-8')
     return struct.pack('!I', len(data)) + data
 
@@ -72,6 +85,7 @@ def recv_exact(sock, count):
 
 
 def recv_obj(sock):
+    """یک بستهٔ طول‌دار را می‌خواند؛ بسته‌های بیش از MAX_PACKET پذیرفته نمی‌شوند."""
     header = recv_exact(sock, 4)
     if not header: return None
     size = struct.unpack('!I', header)[0]
@@ -83,6 +97,7 @@ def recv_obj(sock):
 
 
 def broadcast_targets():
+    """آدرس‌های Broadcast کارت‌های IPv4 را برای کشف همتاها جمع‌آوری می‌کند."""
     targets = {'255.255.255.255'}
     try:
         import psutil
@@ -94,6 +109,7 @@ def broadcast_targets():
     return sorted(targets)
 
 
+# سیگنال‌ها پل امن بین رشته‌های شبکه و رابط Qt هستند؛ ویجت‌ها را از Thread شبکه تغییر ندهید.
 class Events(QObject):
     peers_changed = Signal()
     message_received = Signal(dict)
@@ -101,6 +117,9 @@ class Events(QObject):
     pause_changed = Signal(float, str)
 
 
+# -----------------------------------------------------------------------------
+# لایهٔ شبکه: هر نصب هم‌زمان نقش کلاینت و گیرنده را دارد؛ سرور مرکزی وجود ندارد.
+# -----------------------------------------------------------------------------
 class PeerNetwork:
     """Decentralized LAN peer: each running client advertises and accepts direct messages."""
     def __init__(self, profile, events):
@@ -128,6 +147,7 @@ class PeerNetwork:
             except OSError: pass
 
     def _tcp_server(self):
+        """سوکت TCP را گوش می‌کند و برای هر اتصال، پردازش جداگانه می‌سازد."""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -143,6 +163,7 @@ class PeerNetwork:
             self.events.status.emit(f'خطای شبکه: {e}. شاید برنامه روی این رایانه قبلاً اجرا شده باشد.')
 
     def _handle_connection(self, conn, addr):
+        """درخواست پیام، توقف موقت یا دریافت به‌روزرسانی را پردازش می‌کند."""
         with conn:
             conn.settimeout(60)
             try:
@@ -183,6 +204,7 @@ class PeerNetwork:
             except (OSError, ValueError, UnicodeDecodeError): pass
 
     def _udp_server(self):
+        """Beaconهای UDP را دریافت و فهرست همتاهای آنلاین را به‌روز می‌کند."""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -210,9 +232,11 @@ class PeerNetwork:
             self.events.status.emit(f'کشف خودکار شبکه در دسترس نیست: {e}')
 
     def _beacon_data(self):
+        """اطلاعات شناسایی این نصب را برای اعلام حضور آماده می‌کند."""
         return {'kind':BEACON, 'id':self.profile['id'], 'name':str(self.profile.get('name') or socket.gethostname())[:64], 'port':TCP_PORT, 'version':APP_VERSION, 'time':time.time()}
 
     def _beacon_loop(self):
+        """به‌صورت دوره‌ای حضور را به Broadcastهای شبکه اعلام می‌کند."""
         while self.running:
             s = self.udp
             if s:
@@ -245,6 +269,7 @@ class PeerNetwork:
         with self.lock: return [dict(p) for p in self.peers.values()]
 
     def send_message(self, peer, text, category='direct'):
+        """پیام را مستقیم به IP همتا می‌فرستد؛ گیرنده باید آنلاین و قابل‌دسترسی باشد."""
         request = {'kind':'message', 'from':self.profile['id'], 'to':peer['id'],
                    'name':str(self.profile.get('name') or socket.gethostname())[:64], 'version':APP_VERSION,
                    'category':category, 'text':text, 'time':datetime.now().isoformat(timespec='seconds')}
@@ -253,6 +278,9 @@ class PeerNetwork:
             if not response or not response.get('ok'): raise OSError((response or {}).get('error', 'پاسخ دریافت نشد'))
 
 
+# -----------------------------------------------------------------------------
+# پنجرهٔ تنظیمات: مقادیر این پنجره در LanChat.open_settings ذخیره می‌شوند.
+# -----------------------------------------------------------------------------
 class SettingsDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent); self.app = parent
@@ -296,6 +324,9 @@ class SettingsDialog(QDialog):
                 'always_on_top':self.topmost.isChecked(), 'start_with_windows':self.startup.isChecked(), 'notification_duration':self.toast_duration.value(), 'font_family':self.font.currentFont().family(), 'font_size':self.font_size.value()}
 
 
+# -----------------------------------------------------------------------------
+# رابط اصلی: فهرست همتاها، گفت‌وگوها، اعلان‌ها، گروه‌های محلی و سینی ویندوز.
+# -----------------------------------------------------------------------------
 class LanChat(QMainWindow):
     def __init__(self):
         super().__init__(); self.profile = load_profile(); save_profile(self.profile)
@@ -348,6 +379,7 @@ class LanChat(QMainWindow):
         if QSystemTrayIcon.isSystemTrayAvailable(): self.tray.show()
 
     def _setup_notification_popup(self):
+        """پنجرهٔ اعلان شناور مستقل از اعلان بومی ویندوز را ایجاد می‌کند."""
         # A native tray balloon is not guaranteed to appear on every Windows setup.
         # This lightweight in-app toast is a fallback, independent of Windows toast settings.
         self.toast = QWidget(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
@@ -368,6 +400,7 @@ class LanChat(QMainWindow):
         self.showNormal(); self.raise_(); self.activateWindow()
 
     def show_notification(self, sender, text, category='direct'):
+        """اعلان خوانا را روی صفحه نشان می‌دهد؛ برای پیام گروهی/همگانی نیز فراخوانی می‌شود."""
         if not self.profile.get('notifications', True):
             return
         is_group = category in ('group', 'broadcast')
@@ -407,6 +440,7 @@ class LanChat(QMainWindow):
         if self.isVisible(): self.show()
 
     def apply_theme(self):
+        """پوسته، فونت و رنگ‌های انتخابی را روی برنامه و اعلان شناور اعمال می‌کند."""
         # Terminal-inspired palette, with Tahoma for reliable Persian glyph coverage.
         font = QFont(str(self.profile.get('font_family', 'Tahoma')), int(self.profile.get('font_size', 10)))
         QApplication.instance().setFont(font)
@@ -659,6 +693,7 @@ class LanChat(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def receive_message(self, msg):
+        """پیام دریافتی را در گفت‌وگو/فایل محلی ثبت و اعلان مناسب را نمایش می‌دهد."""
         peer_id = msg['from']; stamp = msg.get('time','')
         try: stamp = datetime.fromisoformat(stamp).strftime('%H:%M:%S')
         except Exception: stamp = datetime.now().strftime('%H:%M:%S')
@@ -670,6 +705,7 @@ class LanChat(QMainWindow):
         self.refresh_peers()
 
     def apply_startup_setting(self):
+        """گزینهٔ اجرای خودکار را در Run رجیستری حساب فعلی ویندوز اعمال می‌کند."""
         if platform.system() != 'Windows': return
         try:
             import winreg
@@ -708,6 +744,7 @@ class LanChat(QMainWindow):
         self.network.stop(); self.toast.hide(); self.tray.hide(); QApplication.quit()
 
 
+# نقطهٔ شروع برنامه؛ تنظیم QuitOnLastWindowClosed=False برای زنده ماندن در System Tray لازم است.
 def main():
     app = QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setQuitOnLastWindowClosed(False)
     try:
